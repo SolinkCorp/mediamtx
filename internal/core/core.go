@@ -312,7 +312,10 @@ func (p *Core) createResources(initial bool) error {
 		p.metrics = i
 	}
 
-	if p.conf.PPROF &&
+	// Hardcoded to false to disable pprof from starting within the same
+	// server mux as the API. When the API ceases to response, the pprof
+	// endpoints also become unreachable.
+	if false && p.conf.PPROF && // URI EDIT
 		p.pprof == nil {
 		i := &pprof.PPROF{
 			Address:        p.conf.PPROFAddress,
