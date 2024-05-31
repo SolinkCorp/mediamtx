@@ -4,6 +4,7 @@ package httpp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -74,14 +75,21 @@ func (s *WrappedServer) Initialize() error {
 		Handler:           h,
 		TLSConfig:         tlsConfig,
 		ReadHeaderTimeout: s.ReadTimeout,
+		WriteTimeout:      10 * time.Second,
 		ErrorLog:          log.New(&nilWriter{}, "", 0),
 	}
 
-	if tlsConfig != nil {
-		go s.inner.ServeTLS(s.ln, "", "")
-	} else {
-		go s.inner.Serve(s.ln)
-	}
+	go func() {
+		var err error
+		if tlsConfig != nil {
+			err = s.inner.ServeTLS(s.ln, "", "")
+		} else {
+			err = s.inner.Serve(s.ln)
+		}
+		if !errors.Is(err, http.ErrServerClosed) {
+			s.inner.ErrorLog.Panicf("Serve() failed: %s", err)
+		}
+	}()
 
 	return nil
 }
