@@ -4,14 +4,14 @@ go 1.23.0
 
 require (
 	code.cloudfoundry.org/bytefmt v0.0.0
-	github.com/MicahParks/jwkset v0.7.0
-	github.com/MicahParks/keyfunc/v3 v3.3.8
-	github.com/abema/go-mp4 v1.4.0
+	github.com/MicahParks/jwkset v0.8.0
+	github.com/MicahParks/keyfunc/v3 v3.3.10
+	github.com/abema/go-mp4 v1.4.1
 	github.com/alecthomas/kong v1.6.1
 	github.com/asticode/go-astits v1.13.0
 	github.com/bluenviron/gohlslib/v2 v2.1.2
-	github.com/bluenviron/gortsplib/v4 v4.12.1
-	github.com/bluenviron/mediacommon v1.13.3
+	github.com/bluenviron/gortsplib/v4 v4.12.2
+	github.com/bluenviron/mediacommon v1.13.4-0.20250119173005-20b296ab1174
 	github.com/datarhei/gosrt v0.8.0
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/gin-contrib/pprof v1.5.2
@@ -24,11 +24,11 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/matthewhartstonge/argon2 v1.1.1
-	github.com/pion/ice/v4 v4.0.3
+	github.com/pion/ice/v4 v4.0.5
 	github.com/pion/interceptor v0.1.37
 	github.com/pion/logging v0.2.2
 	github.com/pion/rtcp v1.2.15
-	github.com/pion/rtp v1.8.10
+	github.com/pion/rtp v1.8.11
 	github.com/pion/sdp/v3 v3.0.10
 	github.com/pion/webrtc/v4 v4.0.7
 	github.com/stretchr/testify v1.10.0
@@ -101,6 +101,6 @@ require (
 
 replace code.cloudfoundry.org/bytefmt => github.com/cloudfoundry/bytefmt v0.0.0-20211005130812-5bb3c17173e5
 
-replace github.com/pion/ice/v4 => github.com/aler9/ice/v4 v4.0.0-20250113220727-1c0b762897da
+replace github.com/pion/ice/v4 => github.com/aler9/ice/v4 v4.0.0-20250119142625-d95137564171
 
-replace github.com/pion/webrtc/v4 => github.com/aler9/webrtc/v4 v4.0.0-20250113221101-1adc4784368c
+replace github.com/pion/webrtc/v4 => github.com/aler9/webrtc/v4 v4.0.0-20250119122430-da50f500fa8e
