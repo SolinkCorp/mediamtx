@@ -109,8 +109,20 @@ func (sf *streamFormat) writeUnitInner(s *Stream, medi *description.Media, u uni
 
 	if sf.gopCache && medi.Type == description.MediaTypeVideo {
 		if isKeyFrame(u) {
-			// Empty the cache and enable caching
-			s.CachedUnits = []unit.Unit{}
+			if s.CachedUnits == nil {
+				// Empty the cache and enable caching
+				s.CachedUnits = []unit.Unit{}
+			} else {
+				// Keep the last packets that were used to generate the key frame. This is to send a full key frame in the RTSP stream.
+				lastPTS := s.CachedUnits[len(s.CachedUnits)-1].GetPTS()
+				i := len(s.CachedUnits)
+				for ; i > 0; i-- {
+					if s.CachedUnits[i-1].GetPTS() != lastPTS {
+						break
+					}
+				}
+				s.CachedUnits = s.CachedUnits[i:]
+			}
 
 		}
 		if s.CachedUnits != nil {
