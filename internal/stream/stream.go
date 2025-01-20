@@ -198,14 +198,23 @@ func (s *Stream) StartReader(reader Reader) {
 
 				go func() {
 					for i, u := range s.CachedUnits {
-						cb(u)
-						// Wait 100ms for the first frame
-						if i == 0 {
-							time.Sleep(100 * time.Millisecond)
+						var hasAU = false
+						switch tunit := u.(type) {
+						case *unit.H264:
+							hasAU = tunit.AU != nil
+						case *unit.H265:
+							hasAU = tunit.AU != nil
 						}
-						// Limit playback speed, to reduce the chance of packet loss
-						if i%5 == 0 {
-							time.Sleep(15 * time.Millisecond)
+						if hasAU {
+							cb(u)
+							// Wait 100ms for the first frame
+							if i == 0 {
+								time.Sleep(100 * time.Millisecond)
+							}
+							// Limit playback speed, to reduce the chance of packet loss
+							if i%5 == 0 {
+								time.Sleep(15 * time.Millisecond)
+							}
 						}
 					}
 				}()
