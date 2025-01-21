@@ -190,7 +190,7 @@ func (s *Stream) StartReader(reader Reader) {
 	for m, sm := range s.streamMedias {
 		for _, sf := range sm.formats {
 			sf.startReader(sr)
-			if m.Type == "video" {
+			if m.Type == description.MediaTypeVideo {
 				cb := sf.runningReaders[sr]
 				if cb == nil {
 					continue
