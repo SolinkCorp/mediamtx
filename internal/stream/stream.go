@@ -197,7 +197,8 @@ func (s *Stream) StartReader(reader Reader) {
 				}
 
 				go func() {
-					for i, u := range s.CachedUnits {
+					i := 0
+					for _, u := range s.CachedUnits {
 						var hasAU = false
 						switch tunit := u.(type) {
 						case *unit.H264:
@@ -215,6 +216,7 @@ func (s *Stream) StartReader(reader Reader) {
 							if i%5 == 0 {
 								time.Sleep(15 * time.Millisecond)
 							}
+							i++
 						}
 					}
 				}()
