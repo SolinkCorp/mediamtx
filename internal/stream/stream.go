@@ -207,6 +207,8 @@ func (s *Stream) StartReader(reader Reader) {
 							hasAU = tunit.AU != nil
 						}
 						if hasAU {
+							size := unitSize(u)
+							atomic.AddUint64(s.bytesSent, size)
 							cb(u)
 							// Wait 100ms for the first frame
 							if i == 0 {
