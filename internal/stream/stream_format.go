@@ -15,6 +15,10 @@ import (
 	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
+const (
+	MaxCachedGOPSize int = 512
+)
+
 func unitSize(u unit.Unit) uint64 {
 	n := uint64(0)
 	for _, pkt := range u.GetRTPPackets() {
@@ -129,8 +133,8 @@ func (sf *streamFormat) writeUnitInner(s *Stream, medi *description.Media, u uni
 			s.CachedUnits = append(s.CachedUnits, u)
 		}
 		l := len(s.CachedUnits)
-		if l > 512 {
-			s.CachedUnits = s.CachedUnits[l-512:]
+		if l > MaxCachedGOPSize {
+			s.CachedUnits = s.CachedUnits[l-MaxCachedGOPSize:]
 		}
 	}
 
