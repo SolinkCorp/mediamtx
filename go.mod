@@ -11,7 +11,7 @@ require (
 	github.com/asticode/go-astits v1.13.0
 	github.com/bluenviron/gohlslib/v2 v2.1.2
 	github.com/bluenviron/gortsplib/v4 v4.12.2
-	github.com/bluenviron/mediacommon v1.13.4
+	github.com/bluenviron/mediacommon v1.13.4-0.20250119173005-20b296ab1174
 	github.com/datarhei/gosrt v0.8.0
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/gin-contrib/pprof v1.5.2
@@ -104,7 +104,3 @@ replace code.cloudfoundry.org/bytefmt => github.com/cloudfoundry/bytefmt v0.0.0-
 replace github.com/pion/ice/v4 => github.com/aler9/ice/v4 v4.0.0-20250119142625-d95137564171
 
 replace github.com/pion/webrtc/v4 => github.com/aler9/webrtc/v4 v4.0.0-20250119122430-da50f500fa8e
-
-replace github.com/bluenviron/mediacommon => github.com/bluenviron/mediacommon v1.13.4-0.20250119173005-20b296ab1174
-
-replace github.com/bluenviron/gortsplib/v4 => github.com/SolinkCorp/gortsplib/v4 v4.0.0-20250204185832-227eea17ed07
