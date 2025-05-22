@@ -32,10 +32,8 @@ func acceptWithContext(ln net.Listener, timeout time.Duration) (net.Conn, error)
 	timer := time.AfterFunc(timeout, func() {
 		ln.Close()
 	})
-
-	conn, err := ln.Accept()
-	timer.Stop()
-	return conn, err
+        defer timer.Stop()
+	return ln.Accept()
 }
 
 // Run implements StaticSource.
