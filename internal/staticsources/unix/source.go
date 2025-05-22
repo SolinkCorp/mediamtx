@@ -36,7 +36,6 @@ func acceptWithContext(ln net.Listener, timeout time.Duration) (net.Conn, error)
 	conn, err := ln.Accept()
 	timer.Stop()
 	return conn, err
-
 }
 
 // Run implements StaticSource.
