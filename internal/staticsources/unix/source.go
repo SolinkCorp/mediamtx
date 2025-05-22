@@ -32,7 +32,7 @@ func acceptWithContext(ln net.Listener, timeout time.Duration) (net.Conn, error)
 	timer := time.AfterFunc(timeout, func() {
 		ln.Close()
 	})
-        defer timer.Stop()
+	defer timer.Stop()
 	return ln.Accept()
 }
 
