@@ -28,8 +28,8 @@ func (s *Source) Log(level logger.Level, format string, args ...interface{}) {
 	s.Parent.Log(level, "[unix source] "+format, args...)
 }
 
-func acceptWithContext(ln net.Listener) (net.Conn, error) {
-	timer := time.AfterFunc(time.Duration(10)*time.Second, func() {
+func acceptWithContext(ln net.Listener, timeout time.Duration) (net.Conn, error) {
+	timer := time.AfterFunc(timeout, func() {
 		ln.Close()
 	})
 
@@ -61,7 +61,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 	}
 	defer socket.Close()
 
-	conn, err := acceptWithContext(socket)
+	conn, err := acceptWithContext(socket, time.Duration(10)*time.Second)
 	if err != nil {
 		return err
 	}
