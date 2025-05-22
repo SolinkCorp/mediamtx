@@ -2,7 +2,6 @@
 package unix
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"os"
@@ -29,37 +28,15 @@ func (s *Source) Log(level logger.Level, format string, args ...interface{}) {
 	s.Parent.Log(level, "[unix source] "+format, args...)
 }
 
-func acceptWithContext(ctx context.Context, ln net.Listener) (net.Conn, error) {
-	connChan := make(chan net.Conn)
-	errChan := make(chan error)
+func acceptWithContext(ln net.Listener) (net.Conn, error) {
+	timer := time.AfterFunc(time.Duration(10)*time.Second, func() {
+		ln.Close()
+	})
 
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case _, ok := <-errChan:
-				if !ok {
-					return
-				} else {
-					errChan <- err
-				}
-			default:
-				errChan <- err
-			}
-		} else {
-			connChan <- conn
-		}
-	}()
+	conn, err := ln.Accept()
+	timer.Stop()
+	return conn, err
 
-	select {
-	case <-ctx.Done():
-		close(errChan)
-		return nil, ctx.Err()
-	case err := <-errChan:
-		return nil, err
-	case conn := <-connChan:
-		return conn, nil
-	}
 }
 
 // Run implements StaticSource.
@@ -77,9 +54,6 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 		s.Log(logger.Debug, "Failed to remove previous unix socket", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	var socket net.Listener
 	socket, err = net.Listen(network, address)
 	if err != nil {
@@ -87,7 +61,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 	}
 	defer socket.Close()
 
-	conn, err := acceptWithContext(ctx, socket)
+	conn, err := acceptWithContext(socket)
 	if err != nil {
 		return err
 	}
