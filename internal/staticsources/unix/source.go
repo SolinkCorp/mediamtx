@@ -28,6 +28,29 @@ func (s *Source) Log(level logger.Level, format string, args ...interface{}) {
 	s.Parent.Log(level, "[unix source] "+format, args...)
 }
 
+func acceptWithTimeout(ln net.Listener, timeout time.Duration) (net.Conn, error) {
+	connChan := make(chan net.Conn)
+	errChan := make(chan error)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errChan <- err
+			return
+		}
+		connChan <- conn
+	}()
+
+	select {
+	case conn := <-connChan:
+		return conn, nil
+	case err := <-errChan:
+		return nil, err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("accept timeout after %s", timeout)
+	}
+}
+
 // Run implements StaticSource.
 func (s *Source) Run(params defs.StaticSourceRunParams) error {
 	s.Log(logger.Debug, "connecting")
@@ -50,7 +73,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 	}
 	defer socket.Close()
 
-	conn, err := socket.Accept()
+	conn, err := acceptWithTimeout(socket, 10*time.Second)
 	if err != nil {
 		return err
 	}
