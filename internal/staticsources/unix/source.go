@@ -2,6 +2,7 @@
 package unix
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -28,7 +29,7 @@ func (s *Source) Log(level logger.Level, format string, args ...interface{}) {
 	s.Parent.Log(level, "[unix source] "+format, args...)
 }
 
-func acceptWithTimeout(ln net.Listener, timeout time.Duration) (net.Conn, error) {
+func acceptWithContext(ctx context.Context, ln net.Listener) (net.Conn, error) {
 	connChan := make(chan net.Conn)
 	errChan := make(chan error)
 
@@ -36,18 +37,18 @@ func acceptWithTimeout(ln net.Listener, timeout time.Duration) (net.Conn, error)
 		conn, err := ln.Accept()
 		if err != nil {
 			errChan <- err
-			return
+		} else {
+			connChan <- conn
 		}
-		connChan <- conn
 	}()
 
 	select {
-	case conn := <-connChan:
-		return conn, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case err := <-errChan:
 		return nil, err
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("accept timeout after %s", timeout)
+	case conn := <-connChan:
+		return conn, nil
 	}
 }
 
@@ -66,6 +67,9 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 		s.Log(logger.Debug, "Failed to remove previous unix socket", err)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	var socket net.Listener
 	socket, err = net.Listen(network, address)
 	if err != nil {
@@ -73,7 +77,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 	}
 	defer socket.Close()
 
-	conn, err := acceptWithTimeout(socket, 10*time.Second)
+	conn, err := acceptWithContext(ctx, socket)
 	if err != nil {
 		return err
 	}
