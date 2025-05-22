@@ -27,7 +27,7 @@ func TestSource(t *testing.T) {
 	)
 	defer te.Close()
 
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	conn, err := net.Dial("unix", "/tmp/mediamtx-test.sock")
 	require.NoError(t, err)

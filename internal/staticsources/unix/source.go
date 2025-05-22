@@ -36,6 +36,11 @@ func acceptWithContext(ctx context.Context, ln net.Listener) (net.Conn, error) {
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
+			// Check if channel is closed before sending
+			_, ok := <-errChan
+			if !ok {
+				return
+			}
 			errChan <- err
 		} else {
 			connChan <- conn
@@ -44,6 +49,7 @@ func acceptWithContext(ctx context.Context, ln net.Listener) (net.Conn, error) {
 
 	select {
 	case <-ctx.Done():
+		close(errChan)
 		return nil, ctx.Err()
 	case err := <-errChan:
 		return nil, err
