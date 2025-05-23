@@ -58,7 +58,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 	}
 	defer socket.Close()
 
-	conn, err := acceptWithTimeout(socket, 10*time.Second)
+	conn, err := acceptWithTimeout(socket, 5*time.Minute)
 	if err != nil {
 		return err
 	}
