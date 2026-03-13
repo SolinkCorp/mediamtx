@@ -43,6 +43,7 @@ type streamFormat struct {
 	alwaysAvailable   bool
 	rtpMaxPayloadSize int
 	replaceNTP        bool
+	gopCacheEnabled   bool
 	processingErrors  *errordumper.Dumper
 	addBytesReceived  func(uint64)
 	addBytesSent      func(uint64)
@@ -57,6 +58,7 @@ type streamFormat struct {
 	rtpTimeOffset uint32
 	ntpEstimator  *ntpestimator.Estimator
 	onDatas       map[*Reader]OnDataFunc
+	cache         *gopCache
 }
 
 func (sf *streamFormat) initialize() error {
@@ -70,6 +72,10 @@ func (sf *streamFormat) initialize() error {
 	}
 
 	sf.onDatas = make(map[*Reader]OnDataFunc)
+
+	if sf.gopCacheEnabled {
+		sf.cache = &gopCache{parent: sf.parent}
+	}
 
 	return nil
 }

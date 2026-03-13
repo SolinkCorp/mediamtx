@@ -78,6 +78,7 @@ type pathManager struct {
 	writeQueueSize    int
 	udpReadBufferSize uint
 	rtpMaxPayloadSize int
+	gopCache          bool
 	pathConfs         map[string]*conf.Path
 	authManager       pathManagerAuthManager
 	externalCmdPool   *externalcmd.Pool
@@ -451,6 +452,7 @@ func (pm *pathManager) createPath(
 		writeQueueSize:    pm.writeQueueSize,
 		udpReadBufferSize: pm.udpReadBufferSize,
 		rtpMaxPayloadSize: pm.rtpMaxPayloadSize,
+		gopCache:          pm.gopCache,
 		conf:              pathConf,
 		name:              name,
 		matches:           matches,

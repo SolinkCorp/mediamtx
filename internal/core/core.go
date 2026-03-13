@@ -436,6 +436,7 @@ func (p *Core) createResources(initial bool) error {
 			writeQueueSize:    p.conf.WriteQueueSize,
 			udpReadBufferSize: p.conf.UDPReadBufferSize,
 			rtpMaxPayloadSize: rtpMaxPayloadSize,
+			gopCache:          p.conf.GopCache,
 			pathConfs:         p.conf.Paths,
 			authManager:       p.authManager,
 			externalCmdPool:   p.externalCmdPool,
@@ -805,6 +806,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.UDPReadBufferSize != p.conf.UDPReadBufferSize ||
 		newConf.UDPMaxPayloadSize != p.conf.UDPMaxPayloadSize ||
 		newConf.RTSPEncryption != p.conf.RTSPEncryption ||
+		newConf.GopCache != p.conf.GopCache ||
 		closeMetrics ||
 		closeAuthManager ||
 		closeLogger

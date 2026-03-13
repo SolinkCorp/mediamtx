@@ -15,6 +15,7 @@ type streamMedia struct {
 	alwaysAvailable   bool
 	rtpMaxPayloadSize int
 	replaceNTP        bool
+	gopCacheEnabled   bool
 	addBytesReceived  func(uint64)
 	addBytesSent      func(uint64)
 	updateLastTime    func(time.Duration)
@@ -35,6 +36,7 @@ func (sm *streamMedia) initialize() error {
 			alwaysAvailable:   sm.alwaysAvailable,
 			rtpMaxPayloadSize: sm.rtpMaxPayloadSize,
 			replaceNTP:        sm.replaceNTP,
+			gopCacheEnabled:   sm.gopCacheEnabled && isVideoFormat(forma),
 			processingErrors:  sm.processingErrors,
 			addBytesReceived:  sm.addBytesReceived,
 			addBytesSent:      sm.addBytesSent,

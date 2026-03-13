@@ -11,6 +11,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5"
 	rtspauth "github.com/bluenviron/gortsplib/v5/pkg/auth"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/headers"
 	"github.com/google/uuid"
 
@@ -307,12 +308,53 @@ func (s *session) onPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, e
 			Reader:          *s.APIReaderDescribe(),
 			Query:           s.rsession.Query(),
 		})
+
+		// GOP cache replay for RTSP unicast sessions.
+		if s.stream != nil && s.rsession.Transport().Protocol != gortsplib.ProtocolUDPMulticast {
+			s.replayGopCache()
+		}
 	}
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
 		Header:     h,
 	}, nil
+}
+
+func (s *session) replayGopCache() {
+	for _, medi := range s.stream.Desc.Medias {
+		if medi.Type != description.MediaTypeVideo {
+			continue
+		}
+
+		cached := s.stream.GopCacheSnapshot(medi)
+		if len(cached) == 0 {
+			continue
+		}
+
+		// Compress timestamps at 100fps (900 ticks per frame at 90kHz clock)
+		// so the RTSP client's jitter buffer displays frames immediately
+		// rather than spacing them out over the original GOP interval.
+		const ticksPerFrame = uint32(900)
+		frameCount := uint32(len(cached))
+		lastTS := cached[len(cached)-1].RTPPackets[0].Timestamp
+		startTS := lastTS - frameCount*ticksPerFrame
+
+		for i, cu := range cached {
+			adjustedTS := startTS + uint32(i)*ticksPerFrame
+
+			for _, pkt := range cu.RTPPackets {
+				clone := *pkt
+				clone.Payload = append([]byte(nil), pkt.Payload...)
+				clone.Timestamp = adjustedTS
+				err := s.rsession.WritePacketRTP(medi, &clone)
+				if err != nil {
+					s.Log(logger.Warn, "GOP cache replay error: %v", err)
+					return
+				}
+			}
+		}
+	}
 }
 
 // onRecord is called by rtspServer.

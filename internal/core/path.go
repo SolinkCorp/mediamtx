@@ -75,6 +75,7 @@ type path struct {
 	writeQueueSize    int
 	udpReadBufferSize uint
 	rtpMaxPayloadSize int
+	gopCache          bool
 	conf              *conf.Path
 	name              string
 	matches           []string
@@ -795,6 +796,7 @@ func (pa *path) setAvailable(
 		WriteQueueSize:        pa.writeQueueSize,
 		RTPMaxPayloadSize:     pa.rtpMaxPayloadSize,
 		ReplaceNTP:            replaceNTP,
+		GopCache:              pa.gopCache,
 		Parent:                pa,
 	}
 	err := pa.stream.Initialize()

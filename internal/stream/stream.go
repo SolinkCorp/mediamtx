@@ -18,6 +18,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 func mediasFromAlwaysAvailableFile(alwaysAvailableFile string) ([]*description.Media, error) {
@@ -319,6 +320,7 @@ type Stream struct {
 	WriteQueueSize        int
 	RTPMaxPayloadSize     int
 	ReplaceNTP            bool
+	GopCache              bool
 	Parent                logger.Writer
 
 	offlineDesc      *description.Session
@@ -396,6 +398,7 @@ func (s *Stream) Initialize() error {
 			alwaysAvailable:   s.AlwaysAvailable,
 			rtpMaxPayloadSize: s.RTPMaxPayloadSize,
 			replaceNTP:        s.ReplaceNTP,
+			gopCacheEnabled:   s.GopCache,
 			addBytesReceived:  s.addBytesReceived,
 			addBytesSent:      s.addBytesSent,
 			updateLastTime:    s.updateLastTime,
@@ -539,10 +542,69 @@ func (s *Stream) AddReader(r *Reader) {
 	r.queueSize = s.WriteQueueSize
 	r.start()
 
+	// Replay cached GOP to the new reader for instant video.
+	if s.GopCache {
+		s.replayGopCache(r)
+	}
+
 	select {
 	case <-s.hasReaders:
 	default:
 		close(s.hasReaders)
+	}
+}
+
+func (s *Stream) replayGopCache(r *Reader) {
+	for medi, formats := range r.onDatas {
+		sm := s.medias[medi]
+
+		for forma, onData := range formats {
+			sf := sm.formats[forma]
+			if sf.cache == nil {
+				continue
+			}
+
+			cached := sf.cache.snapshot()
+			if len(cached) == 0 {
+				continue
+			}
+
+			// Replay with compressed timestamps (100fps = 900 ticks per frame at 90kHz).
+			const ticksPerFrame = int64(900)
+			lastPTS := cached[len(cached)-1].PTS
+			frameCount := int64(len(cached))
+			startPTS := lastPTS - frameCount*ticksPerFrame
+
+			cOnData := onData
+			_ = forma // used via sf
+
+			for i, cu := range cached {
+				adjustedPTS := startPTS + int64(i)*ticksPerFrame
+
+				// Clone RTP packets with adjusted timestamps.
+				var pkts []*rtp.Packet
+				if len(cu.RTPPackets) > 0 {
+					pkts = make([]*rtp.Packet, len(cu.RTPPackets))
+					for j, pkt := range cu.RTPPackets {
+						clone := *pkt
+						clone.Payload = append([]byte(nil), pkt.Payload...)
+						clone.Timestamp = uint32(adjustedPTS) + sf.rtpTimeOffset
+						pkts[j] = &clone
+					}
+				}
+
+				replayUnit := &unit.Unit{
+					PTS:        adjustedPTS,
+					NTP:        cu.NTP,
+					RTPPackets: pkts,
+					Payload:    cu.Payload,
+				}
+
+				r.push(func() error {
+					return cOnData(replayUnit)
+				})
+			}
+		}
 	}
 }
 
@@ -564,6 +626,27 @@ func (s *Stream) RemoveReader(r *Reader) {
 	}
 
 	delete(s.readers, r)
+}
+
+// GopCacheSnapshot returns a snapshot of the GOP cache for the given media.
+// Used by RTSP sessions for GOP replay on PLAY.
+func (s *Stream) GopCacheSnapshot(medi *description.Media) []*GopCachedUnit {
+	if !s.GopCache {
+		return nil
+	}
+
+	sm := s.medias[medi]
+	if sm == nil {
+		return nil
+	}
+
+	for _, sf := range sm.formats {
+		if sf.cache != nil {
+			return sf.cache.snapshot()
+		}
+	}
+
+	return nil
 }
 
 // WaitForReaders waits for the stream to have at least one reader.

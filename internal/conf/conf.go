@@ -256,6 +256,7 @@ type Conf struct {
 	RunOnConnect        string          `json:"runOnConnect"`
 	RunOnConnectRestart bool            `json:"runOnConnectRestart"`
 	RunOnDisconnect     string          `json:"runOnDisconnect"`
+	GopCache            bool            `json:"gopCache"`
 
 	// Authentication
 	AuthMethod                AuthMethod                   `json:"authMethod"`
