@@ -569,27 +569,26 @@ func (s *Stream) gopReplayWrapper(sf *streamFormat, onData OnDataFunc) OnDataFun
 	const msPerFrame = 10 * time.Millisecond
 
 	frameCount := int64(len(cached))
-	lastPTS := cached[len(cached)-1].PTS
-	startPTS := lastPTS - frameCount*ticksPerFrame
-
-	// Anchor compressed RTP timestamps on the last cached frame's original timestamp
-	// so the transition to live is seamless.
-	var lastOrigRTPTS uint32
-	if len(cached[len(cached)-1].RTPPackets) > 0 {
-		lastOrigRTPTS = cached[len(cached)-1].RTPPackets[0].Timestamp
-	}
-
 	replayed := false
 
 	return func(u *unit.Unit) error {
 		if !replayed {
 			replayed = true
 
+			if len(u.RTPPackets) == 0 {
+				return onData(u)
+			}
+
+			// Anchor compressed timestamps on the first live frame
+			// so the replay leads directly into the live stream.
+			liveRTPTS := u.RTPPackets[0].Timestamp
+
 			ticker := time.NewTicker(msPerFrame)
+			defer ticker.Stop()
 
 			for i, cu := range cached {
-				adjustedPTS := startPTS + int64(i)*ticksPerFrame
-				compressedRTPTS := lastOrigRTPTS - uint32((frameCount-1-int64(i))*ticksPerFrame)
+				adjustedPTS := u.PTS - (frameCount-int64(i))*ticksPerFrame
+				compressedRTPTS := liveRTPTS - uint32((frameCount-int64(i))*ticksPerFrame)
 
 				var pkts []*rtp.Packet
 				if len(cu.RTPPackets) > 0 {
