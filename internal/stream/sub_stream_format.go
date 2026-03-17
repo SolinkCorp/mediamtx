@@ -171,7 +171,7 @@ func (ssf *subStreamFormat) writeUnitInner(u *unit.Unit) error {
 
 	// Cache video units for GOP cache replay to new readers.
 	if ssf.streamFormat.cache != nil && !u.NilPayload() {
-		isKey := isVideoKeyFrame(ssf.streamFormat.format, u.Payload)
+		isKey := isVideoKeyFrame(u.Payload)
 		ssf.streamFormat.cache.add(u, isKey)
 	}
 

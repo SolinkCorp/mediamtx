@@ -113,25 +113,20 @@ func TestGopCacheSnapshotIndependent(t *testing.T) {
 }
 
 func TestIsVideoKeyFrame(t *testing.T) {
-	h264Format := &format.H264{}
-	h265Format := &format.H265{}
-	av1Format := &format.AV1{}
-
 	for _, ca := range []struct {
-		name   string
-		forma  format.Format
+		name    string
 		payload unit.Payload
-		expect bool
+		expect  bool
 	}{
-		{"h264 IDR", h264Format, unit.PayloadH264{{5, 1}}, true},
-		{"h264 non-IDR", h264Format, unit.PayloadH264{{0x41, 1}}, false},
-		{"h265 IDR_W_RADL", h265Format, unit.PayloadH265{{0x26, 1}}, true},
-		{"h265 non-IDR", h265Format, unit.PayloadH265{{0x02, 1}}, false},
-		{"av1 sequence header", av1Format, unit.PayloadAV1{{0x0a, 1}}, true},
-		{"av1 frame", av1Format, unit.PayloadAV1{{0x32, 1}}, false},
+		{"h264 IDR", unit.PayloadH264{{5, 1}}, true},
+		{"h264 non-IDR", unit.PayloadH264{{0x41, 1}}, false},
+		{"h265 IDR_W_RADL", unit.PayloadH265{{0x26, 1}}, true},
+		{"h265 non-IDR", unit.PayloadH265{{0x02, 1}}, false},
+		{"av1 sequence header", unit.PayloadAV1{{0x0a, 1}}, true},
+		{"av1 frame", unit.PayloadAV1{{0x32, 1}}, false},
 	} {
 		t.Run(ca.name, func(t *testing.T) {
-			require.Equal(t, ca.expect, isVideoKeyFrame(ca.forma, ca.payload))
+			require.Equal(t, ca.expect, isVideoKeyFrame(ca.payload))
 		})
 	}
 }

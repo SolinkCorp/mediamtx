@@ -25,10 +25,10 @@ type GopCachedUnit struct {
 }
 
 type gopCache struct {
-	mu            sync.Mutex
-	units         []*GopCachedUnit
-	overflowOnce  bool
-	parent        logger.Writer
+	mu           sync.Mutex
+	units        []*GopCachedUnit
+	overflowOnce bool
+	parent       logger.Writer
 }
 
 func (c *gopCache) add(u *unit.Unit, isKeyFrame bool) {
@@ -88,7 +88,7 @@ func (c *gopCache) snapshot() []*GopCachedUnit {
 	return out
 }
 
-func isVideoKeyFrame(forma format.Format, payload unit.Payload) bool {
+func isVideoKeyFrame(payload unit.Payload) bool {
 	switch payload := payload.(type) {
 	case unit.PayloadH264:
 		return mch264.IsRandomAccess(payload)

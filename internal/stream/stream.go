@@ -535,17 +535,16 @@ func (s *Stream) AddReader(r *Reader) {
 
 		for forma, onData := range formats {
 			sf := sm.formats[forma]
-			sf.onDatas[r] = onData
+			if s.GopCache {
+				sf.onDatas[r] = s.gopReplayWrapper(sf, onData)
+			} else {
+				sf.onDatas[r] = onData
+			}
 		}
 	}
 
 	r.queueSize = s.WriteQueueSize
 	r.start()
-
-	// Replay cached GOP to the new reader for instant video.
-	if s.GopCache {
-		s.replayGopCache(r)
-	}
 
 	select {
 	case <-s.hasReaders:
@@ -554,41 +553,51 @@ func (s *Stream) AddReader(r *Reader) {
 	}
 }
 
-func (s *Stream) replayGopCache(r *Reader) {
-	for medi, formats := range r.onDatas {
-		sm := s.medias[medi]
+// gopReplayWrapper wraps an OnDataFunc to replay cached GOP frames
+// before the first live frame, then delegates to the original callback.
+func (s *Stream) gopReplayWrapper(sf *streamFormat, onData OnDataFunc) OnDataFunc {
+	if sf.cache == nil {
+		return onData
+	}
 
-		for forma, onData := range formats {
-			sf := sm.formats[forma]
-			if sf.cache == nil {
-				continue
-			}
+	cached := sf.cache.snapshot()
+	if len(cached) == 0 {
+		return onData
+	}
 
-			cached := sf.cache.snapshot()
-			if len(cached) == 0 {
-				continue
-			}
+	const ticksPerFrame = int64(900)
+	const msPerFrame = 10 * time.Millisecond
 
-			// Replay with compressed timestamps (100fps = 900 ticks per frame at 90kHz).
-			const ticksPerFrame = int64(900)
-			lastPTS := cached[len(cached)-1].PTS
-			frameCount := int64(len(cached))
-			startPTS := lastPTS - frameCount*ticksPerFrame
+	frameCount := int64(len(cached))
+	lastPTS := cached[len(cached)-1].PTS
+	startPTS := lastPTS - frameCount*ticksPerFrame
 
-			cOnData := onData
-			_ = forma // used via sf
+	// Anchor compressed RTP timestamps on the last cached frame's original timestamp
+	// so the transition to live is seamless.
+	var lastOrigRTPTS uint32
+	if len(cached[len(cached)-1].RTPPackets) > 0 {
+		lastOrigRTPTS = cached[len(cached)-1].RTPPackets[0].Timestamp
+	}
+
+	replayed := false
+
+	return func(u *unit.Unit) error {
+		if !replayed {
+			replayed = true
+
+			ticker := time.NewTicker(msPerFrame)
 
 			for i, cu := range cached {
 				adjustedPTS := startPTS + int64(i)*ticksPerFrame
+				compressedRTPTS := lastOrigRTPTS - uint32((frameCount-1-int64(i))*ticksPerFrame)
 
-				// Clone RTP packets with adjusted timestamps.
 				var pkts []*rtp.Packet
 				if len(cu.RTPPackets) > 0 {
 					pkts = make([]*rtp.Packet, len(cu.RTPPackets))
 					for j, pkt := range cu.RTPPackets {
 						clone := *pkt
 						clone.Payload = append([]byte(nil), pkt.Payload...)
-						clone.Timestamp = uint32(adjustedPTS) + sf.rtpTimeOffset
+						clone.Timestamp = compressedRTPTS
 						pkts[j] = &clone
 					}
 				}
@@ -600,11 +609,15 @@ func (s *Stream) replayGopCache(r *Reader) {
 					Payload:    cu.Payload,
 				}
 
-				r.push(func() error {
-					return cOnData(replayUnit)
-				})
+				if err := onData(replayUnit); err != nil {
+					return err
+				}
+
+				<-ticker.C
 			}
 		}
+
+		return onData(u)
 	}
 }
 
