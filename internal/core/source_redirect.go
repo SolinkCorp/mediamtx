@@ -8,12 +8,12 @@ import (
 // sourceRedirect is a source that redirects to another one.
 type sourceRedirect struct{}
 
-func (*sourceRedirect) Log(logger.Level, string, ...interface{}) {
+func (*sourceRedirect) Log(logger.Level, string, ...any) {
 }
 
 // APISourceDescribe implements source.
-func (*sourceRedirect) APISourceDescribe() defs.APIPathSourceOrReader {
-	return defs.APIPathSourceOrReader{
+func (*sourceRedirect) APISourceDescribe() *defs.APIPathSource {
+	return &defs.APIPathSource{
 		Type: "redirect",
 		ID:   "",
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -16,6 +17,10 @@ import (
 
 // ErrMuxerNotFound is returned when a muxer is not found.
 var ErrMuxerNotFound = errors.New("muxer not found")
+
+func interfaceIsEmpty(i any) bool {
+	return reflect.ValueOf(i).Kind() != reflect.Pointer || reflect.ValueOf(i).IsNil()
+}
 
 type serverGetMuxerRes struct {
 	muxer *muxer
@@ -49,7 +54,12 @@ type serverAPIMuxersGetReq struct {
 	res  chan serverAPIMuxersGetRes
 }
 
+type serverMetrics interface {
+	SetHLSServer(defs.APIHLSServer)
+}
+
 type serverPathManager interface {
+	SetHLSServer(*Server) []defs.Path
 	FindPathConf(req defs.PathFindPathConfReq) (*conf.Path, error)
 	AddReader(req defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
 }
@@ -61,10 +71,11 @@ type serverParent interface {
 // Server is a HLS server.
 type Server struct {
 	Address         string
+	DumpPackets     bool
 	Encryption      bool
 	ServerKey       string
 	ServerCert      string
-	AllowOrigin     string
+	AllowOrigins    []string
 	TrustedProxies  conf.IPNetworks
 	AlwaysRemux     bool
 	Variant         conf.HLSVariant
@@ -74,7 +85,9 @@ type Server struct {
 	SegmentMaxSize  conf.StringSize
 	Directory       string
 	ReadTimeout     conf.Duration
+	WriteTimeout    conf.Duration
 	MuxerCloseAfter conf.Duration
+	Metrics         serverMetrics
 	PathManager     serverPathManager
 	Parent          serverParent
 
@@ -109,12 +122,14 @@ func (s *Server) Initialize() error {
 
 	s.httpServer = &httpServer{
 		address:        s.Address,
+		dumpPackets:    s.DumpPackets,
 		encryption:     s.Encryption,
 		serverKey:      s.ServerKey,
 		serverCert:     s.ServerCert,
-		allowOrigin:    s.AllowOrigin,
+		allowOrigins:   s.AllowOrigins,
 		trustedProxies: s.TrustedProxies,
 		readTimeout:    s.ReadTimeout,
+		writeTimeout:   s.WriteTimeout,
 		pathManager:    s.PathManager,
 		parent:         s,
 	}
@@ -129,23 +144,45 @@ func (s *Server) Initialize() error {
 	s.wg.Add(1)
 	go s.run()
 
+	if !interfaceIsEmpty(s.Metrics) {
+		s.Metrics.SetHLSServer(s)
+	}
+
 	return nil
 }
 
 // Log implements logger.Writer.
-func (s *Server) Log(level logger.Level, format string, args ...interface{}) {
+func (s *Server) Log(level logger.Level, format string, args ...any) {
 	s.Parent.Log(level, "[HLS] "+format, args...)
 }
 
 // Close closes the server.
 func (s *Server) Close() {
 	s.Log(logger.Info, "listener is closing")
+
+	if !interfaceIsEmpty(s.Metrics) {
+		s.Metrics.SetHLSServer(nil)
+	}
+
 	s.ctxCancel()
 	s.wg.Wait()
 }
 
 func (s *Server) run() {
 	defer s.wg.Done()
+
+	readyPaths := s.PathManager.SetHLSServer(s)
+	defer s.PathManager.SetHLSServer(nil)
+
+	if s.AlwaysRemux {
+		for _, pa := range readyPaths {
+			if !pa.SafeConf().SourceOnDemand {
+				if _, ok := s.muxers[pa.Name()]; !ok {
+					s.createMuxer(pa.Name(), "", "")
+				}
+			}
+		}
+	}
 
 outer:
 	for {
@@ -182,11 +219,11 @@ outer:
 
 		case req := <-s.chAPIMuxerList:
 			data := &defs.APIHLSMuxerList{
-				Items: []*defs.APIHLSMuxer{},
+				Items: []defs.APIHLSMuxer{},
 			}
 
 			for _, muxer := range s.muxers {
-				data.Items = append(data.Items, muxer.apiItem())
+				data.Items = append(data.Items, *muxer.apiItem())
 			}
 
 			sort.Slice(data.Items, func(i, j int) bool {

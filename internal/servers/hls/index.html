@@ -72,7 +72,7 @@ html, body {
 <div id="message"></div>
 <div id="lang-icon"><div id="lang-list"></div></div>
 
-<script src="hls.min.js"></script>
+<script defer src="hls.min.js"></script>
 
 <script>
 
@@ -161,9 +161,9 @@ const loadStream = () => {
 	} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
 		// since it's not possible to detect timeout errors in iOS,
 		// wait for the playlist to be available before starting the stream
-		fetch('index.m3u8')
+		fetch('index.m3u8' + window.location.search)
 			.then(() => {
-				video.src = 'index.m3u8';
+				video.src = 'index.m3u8' + window.location.search;
 				video.play();
 			});
 	}
@@ -187,15 +187,16 @@ const loadAttributesFromQuery = () => {
 	video.muted = parseBoolString(params.get('muted'), true);
 	video.autoplay = parseBoolString(params.get('autoplay'), true);
 	video.playsInline = parseBoolString(params.get('playsinline'), true);
+	video.disablepictureinpicture = parseBoolString(params.get('disablepictureinpicture'), false);
 	defaultControls = video.controls;
 };
 
-const init = () => {
+// use load instead of DOMContentLoaded, otherwise, in Firefox,
+// the page gets stuck in the "loading" state.
+window.addEventListener('load', () => {
 	loadAttributesFromQuery();
 	loadStream();
-};
-
-window.addEventListener('DOMContentLoaded', init);
+});
 
 </script>
 

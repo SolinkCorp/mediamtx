@@ -1,170 +1,81 @@
 package stream
 
 import (
-	"sync/atomic"
+	"crypto/rand"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
-	"github.com/bluenviron/mediacommon/pkg/codecs/h265"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
+	"github.com/bluenviron/gortsplib/v5/pkg/format"
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediamtx/internal/formatprocessor"
+	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/ntpestimator"
 	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
-const (
-	maxCachedGOPSize int = 512
-)
+func multiplyAndDivide(v, m, d int64) int64 {
+	secs := v / d
+	dec := v % d
+	return (secs*m + dec*m/d)
+}
 
-func unitSize(u unit.Unit) uint64 {
+func unitSize(u *unit.Unit) uint64 {
 	n := uint64(0)
-	for _, pkt := range u.GetRTPPackets() {
+	for _, pkt := range u.RTPPackets {
 		n += uint64(pkt.MarshalSize())
 	}
 	return n
 }
 
-func isKeyFrame(u unit.Unit) bool {
-	switch tunit := u.(type) {
-	case *unit.H264:
-		return h264.IDRPresent(tunit.AU)
-	case *unit.H265:
-		return h265.IsRandomAccess(tunit.AU)
+func randUint32() (uint32, error) {
+	var b [4]byte
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, err
 	}
-	return false
-}
-
-func isEmptyAU(u unit.Unit) bool {
-	switch tunit := u.(type) {
-	case *unit.H264:
-		return len(tunit.AU) == 0
-	case *unit.H265:
-		return len(tunit.AU) == 0
-	}
-	return true
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]), nil
 }
 
 type streamFormat struct {
-	udpMaxPayloadSize  int
-	format             format.Format
-	generateRTPPackets bool
-	decodeErrLogger    logger.Writer
+	format            format.Format
+	media             *description.Media
+	alwaysAvailable   bool
+	rtpMaxPayloadSize int
+	replaceNTP        bool
+	gopCacheEnabled   bool
+	processingErrors  *errordumper.Dumper
+	addBytesReceived  func(uint64)
+	addBytesSent      func(uint64)
+	updateLastTime    func(time.Duration)
+	writeRTSP         func(*description.Media, []*rtp.Packet, time.Time)
+	parent            logger.Writer
 
-	proc           formatprocessor.Processor
-	pausedReaders  map[*streamReader]ReadFunc
-	runningReaders map[*streamReader]ReadFunc
-	gopCache       bool
+	ptsOffset     int64
+	formatUpdater formatUpdater
+	unitRemuxer   unitRemuxer
+	rtpEncoder    rtpEncoder
+	rtpTimeOffset uint32
+	ntpEstimator  *ntpestimator.Estimator
+	onDatas       map[*Reader]OnDataFunc
+	cache         *gopCache
 }
 
 func (sf *streamFormat) initialize() error {
-	sf.pausedReaders = make(map[*streamReader]ReadFunc)
-	sf.runningReaders = make(map[*streamReader]ReadFunc)
+	sf.formatUpdater = newFormatUpdater(sf.format)
+	sf.unitRemuxer = newUnitRemuxer(sf.format)
 
-	var err error
-	sf.proc, err = formatprocessor.New(sf.udpMaxPayloadSize, sf.format, sf.generateRTPPackets)
-	if err != nil {
-		return err
+	if sf.replaceNTP {
+		sf.ntpEstimator = &ntpestimator.Estimator{
+			ClockRate: sf.format.ClockRate(),
+		}
+	}
+
+	sf.onDatas = make(map[*Reader]OnDataFunc)
+
+	if sf.gopCacheEnabled {
+		sf.cache = &gopCache{parent: sf.parent}
 	}
 
 	return nil
-}
-
-func (sf *streamFormat) addReader(sr *streamReader, cb ReadFunc) {
-	sf.pausedReaders[sr] = cb
-}
-
-func (sf *streamFormat) removeReader(sr *streamReader) {
-	delete(sf.pausedReaders, sr)
-	delete(sf.runningReaders, sr)
-}
-
-func (sf *streamFormat) startReader(sr *streamReader) {
-	if cb, ok := sf.pausedReaders[sr]; ok {
-		delete(sf.pausedReaders, sr)
-		sf.runningReaders[sr] = cb
-	}
-}
-
-func (sf *streamFormat) writeUnit(s *Stream, medi *description.Media, u unit.Unit) {
-	err := sf.proc.ProcessUnit(u)
-	if err != nil {
-		sf.decodeErrLogger.Log(logger.Warn, err.Error())
-		return
-	}
-
-	sf.writeUnitInner(s, medi, u)
-}
-
-func (sf *streamFormat) writeRTPPacket(
-	s *Stream,
-	medi *description.Media,
-	pkt *rtp.Packet,
-	ntp time.Time,
-	pts int64,
-) {
-	hasNonRTSPReaders := len(sf.pausedReaders) > 0 || len(sf.runningReaders) > 0 || sf.gopCache
-
-	u, err := sf.proc.ProcessRTPPacket(pkt, ntp, pts, hasNonRTSPReaders)
-	if err != nil {
-		sf.decodeErrLogger.Log(logger.Warn, err.Error())
-		return
-	}
-
-	sf.writeUnitInner(s, medi, u)
-}
-
-func (sf *streamFormat) writeUnitInner(s *Stream, medi *description.Media, u unit.Unit) {
-	size := unitSize(u)
-
-	atomic.AddUint64(s.bytesReceived, size)
-
-	if sf.gopCache && medi.Type == description.MediaTypeVideo {
-		if isKeyFrame(u) {
-			if s.CachedUnits == nil {
-				// Initialize the cache and enable caching
-				s.CachedUnits = make([]unit.Unit, 0, maxCachedGOPSize)
-			} else {
-				// Keep the last packets that were used to generate the key frame.
-				// This is to send a full key frame in the RTSP stream.
-				i := len(s.CachedUnits)
-				for ; i > 0; i-- {
-					if !isEmptyAU(s.CachedUnits[i-1]) {
-						break
-					}
-				}
-				s.CachedUnits = s.CachedUnits[i:]
-			}
-		}
-		if s.CachedUnits != nil {
-			s.CachedUnits = append(s.CachedUnits, u)
-		}
-		l := len(s.CachedUnits)
-		if l > maxCachedGOPSize {
-			s.CachedUnits = s.CachedUnits[l-maxCachedGOPSize:]
-			sf.decodeErrLogger.Log(logger.Warn, "GOP cache is full, dropping packets")
-		}
-	}
-
-	if s.rtspStream != nil {
-		for _, pkt := range u.GetRTPPackets() {
-			s.rtspStream.WritePacketRTPWithNTP(medi, pkt, u.GetNTP()) //nolint:errcheck
-		}
-	}
-
-	if s.rtspsStream != nil {
-		for _, pkt := range u.GetRTPPackets() {
-			s.rtspsStream.WritePacketRTPWithNTP(medi, pkt, u.GetNTP()) //nolint:errcheck
-		}
-	}
-
-	for sr, cb := range sf.runningReaders {
-		ccb := cb
-		sr.push(func() error {
-			atomic.AddUint64(s.bytesSent, size)
-			return ccb(u)
-		})
-	}
 }

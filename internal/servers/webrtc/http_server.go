@@ -20,7 +20,6 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
-	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
 //go:embed publish_index.html
@@ -50,7 +49,8 @@ func mergePathAndQuery(path string, rawQuery string) string {
 
 func writeError(ctx *gin.Context, statusCode int, err error) {
 	ctx.JSON(statusCode, &defs.APIError{
-		Error: err.Error(),
+		Status: "error",
+		Error:  err.Error(),
 	})
 }
 
@@ -74,12 +74,14 @@ func sessionLocation(publish bool, path string, rawQuery string, secret uuid.UUI
 
 type httpServer struct {
 	address        string
+	dumpPackets    bool
 	encryption     bool
 	serverKey      string
 	serverCert     string
-	allowOrigin    string
+	allowOrigins   []string
 	trustedProxies conf.IPNetworks
 	readTimeout    conf.Duration
+	writeTimeout   conf.Duration
 	pathManager    serverPathManager
 	parent         *Server
 
@@ -90,21 +92,22 @@ func (s *httpServer) initialize() error {
 	router := gin.New()
 	router.SetTrustedProxies(s.trustedProxies.ToTrustedProxies()) //nolint:errcheck
 
-	router.Use(s.middlewareOrigin)
+	router.Use(s.middlewarePreflightRequests)
 
 	router.Use(s.onRequest)
 
-	network, address := restrictnetwork.Restrict("tcp", s.address)
-
 	s.inner = &httpp.Server{
-		Network:     network,
-		Address:     address,
-		ReadTimeout: time.Duration(s.readTimeout),
-		Encryption:  s.encryption,
-		ServerCert:  s.serverCert,
-		ServerKey:   s.serverKey,
-		Handler:     router,
-		Parent:      s,
+		Address:           s.address,
+		AllowOrigins:      s.allowOrigins,
+		DumpPackets:       s.dumpPackets,
+		DumpPacketsPrefix: "webrtc_server_conn",
+		ReadTimeout:       time.Duration(s.readTimeout),
+		WriteTimeout:      time.Duration(s.writeTimeout),
+		Encryption:        s.encryption,
+		ServerCert:        s.serverCert,
+		ServerKey:         s.serverKey,
+		Handler:           router,
+		Parent:            s,
 	}
 	err := s.inner.Initialize()
 	if err != nil {
@@ -115,7 +118,7 @@ func (s *httpServer) initialize() error {
 }
 
 // Log implements logger.Writer.
-func (s *httpServer) Log(level logger.Level, format string, args ...interface{}) {
+func (s *httpServer) Log(level logger.Level, format string, args ...any) {
 	s.parent.Log(level, format, args...)
 }
 
@@ -124,29 +127,31 @@ func (s *httpServer) close() {
 }
 
 func (s *httpServer) checkAuthOutsideSession(ctx *gin.Context, pathName string, publish bool) bool {
-	req := defs.PathAccessRequest{
-		Name:    pathName,
-		Publish: publish,
-		IP:      net.ParseIP(ctx.ClientIP()),
-		Proto:   auth.ProtocolWebRTC,
-	}
-	req.FillFromHTTPRequest(ctx.Request)
-
 	_, err := s.pathManager.FindPathConf(defs.PathFindPathConfReq{
-		AccessRequest: req,
+		AccessRequest: defs.PathAccessRequest{
+			Name:        pathName,
+			Query:       ctx.Request.URL.RawQuery,
+			Publish:     publish,
+			Proto:       auth.ProtocolWebRTC,
+			Credentials: httpp.Credentials(ctx.Request),
+			IP:          net.ParseIP(ctx.ClientIP()),
+		},
 	})
 	if err != nil {
 		var terr *auth.Error
 		if errors.As(err, &terr) {
 			if terr.AskCredentials {
 				ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
-				ctx.Writer.WriteHeader(http.StatusUnauthorized)
+				ctx.AbortWithStatusJSON(http.StatusUnauthorized, &defs.APIError{
+					Status: "error",
+					Error:  "authentication error",
+				})
 				return false
 			}
 
-			s.Log(logger.Info, "connection %v failed to authenticate: %v", httpp.RemoteAddr(ctx), terr.Message)
+			s.Log(logger.Info, "connection %v failed to authenticate: %v", httpp.RemoteAddr(ctx), terr.Wrapped)
 
-			// wait some seconds to mitigate brute force attacks
+			// wait some seconds to delay brute force attacks
 			<-time.After(auth.PauseAfterError)
 
 			writeError(ctx, http.StatusUnauthorized, terr)
@@ -202,16 +207,22 @@ func (s *httpServer) onWHIPPost(ctx *gin.Context, pathName string, publish bool)
 		if errors.As(err, &terr) {
 			if terr.AskCredentials {
 				ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
-				ctx.AbortWithStatus(http.StatusUnauthorized)
+				ctx.AbortWithStatusJSON(http.StatusUnauthorized, &defs.APIError{
+					Status: "error",
+					Error:  "authentication error",
+				})
 				return
 			}
 
-			s.Log(logger.Info, "connection %v failed to authenticate: %v", httpp.RemoteAddr(ctx), terr.Message)
+			s.Log(logger.Info, "connection %v failed to authenticate: %v", httpp.RemoteAddr(ctx), terr.Wrapped)
 
-			// wait some seconds to mitigate brute force attacks
+			// wait some seconds to delay brute force attacks
 			<-time.After(auth.PauseAfterError)
 
-			writeError(ctx, http.StatusUnauthorized, terr)
+			ctx.AbortWithStatusJSON(http.StatusUnauthorized, &defs.APIError{
+				Status: "error",
+				Error:  "authentication error",
+			})
 			return
 		}
 
@@ -234,6 +245,8 @@ func (s *httpServer) onWHIPPost(ctx *gin.Context, pathName string, publish bool)
 	ctx.Header("Location", sessionLocation(publish, pathName, ctx.Request.URL.RawQuery, res.sx.secret))
 	ctx.Writer.WriteHeader(http.StatusCreated)
 	ctx.Writer.Write(res.answer)
+
+	res.sx.Log(logger.Debug, "SDP answer:\n"+string(res.answer))
 }
 
 func (s *httpServer) onWHIPPatch(ctx *gin.Context, pathName string, rawSecret string) {
@@ -274,7 +287,9 @@ func (s *httpServer) onWHIPPatch(ctx *gin.Context, pathName string, rawSecret st
 		return
 	}
 
-	ctx.Writer.WriteHeader(http.StatusNoContent)
+	ctx.AbortWithStatusJSON(http.StatusNoContent, &defs.APIOK{
+		Status: "ok",
+	})
 }
 
 func (s *httpServer) onWHIPDelete(ctx *gin.Context, pathName string, rawSecret string) {
@@ -297,7 +312,9 @@ func (s *httpServer) onWHIPDelete(ctx *gin.Context, pathName string, rawSecret s
 		return
 	}
 
-	ctx.Writer.WriteHeader(http.StatusOK)
+	ctx.AbortWithStatusJSON(http.StatusOK, &defs.APIOK{
+		Status: "ok",
+	})
 }
 
 func (s *httpServer) onPage(ctx *gin.Context, pathName string, publish bool) {
@@ -305,7 +322,11 @@ func (s *httpServer) onPage(ctx *gin.Context, pathName string, publish bool) {
 		return
 	}
 
-	ctx.Header("Cache-Control", "max-age=3600")
+	// Do not cache the HTML page.
+	// This prevents a bug in Firefox in which, when the page
+	// is loaded in an iframe and the iframe is deleted and recreated,
+	// WebRTC is unable to re-establish the connection.
+	ctx.Header("Cache-Control", "no-cache")
 	ctx.Header("Content-Type", "text/html")
 	ctx.Writer.WriteHeader(http.StatusOK)
 
@@ -316,11 +337,7 @@ func (s *httpServer) onPage(ctx *gin.Context, pathName string, publish bool) {
 	}
 }
 
-func (s *httpServer) middlewareOrigin(ctx *gin.Context) {
-	ctx.Header("Access-Control-Allow-Origin", s.allowOrigin)
-	ctx.Header("Access-Control-Allow-Credentials", "true")
-
-	// preflight requests
+func (s *httpServer) middlewarePreflightRequests(ctx *gin.Context) {
 	if ctx.Request.Method == http.MethodOptions &&
 		ctx.Request.Header.Get("Access-Control-Request-Method") != "" {
 		ctx.Header("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH, DELETE")

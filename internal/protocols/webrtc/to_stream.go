@@ -6,12 +6,23 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/bluenviron/gortsplib/v4/pkg/rtptime"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
+	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/bluenviron/gortsplib/v5/pkg/rtptime"
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+)
+
+type ntpState int
+
+const (
+	ntpStateInitial ntpState = iota
+	ntpStateReplace
+	ntpStateAvailable
 )
 
 var errNoSupportedCodecsTo = errors.New(
@@ -21,10 +32,13 @@ var errNoSupportedCodecsTo = errors.New(
 // ToStream maps a WebRTC connection to a MediaMTX stream.
 func ToStream(
 	pc *PeerConnection,
-	stream **stream.Stream,
+	pathConf *conf.Path,
+	subStream **stream.SubStream,
+	log logger.Writer,
 ) ([]*description.Media, error) {
 	var medias []*description.Media //nolint:prealloc
-	timeDecoder := rtptime.NewGlobalDecoder2()
+	timeDecoder := &rtptime.GlobalDecoder{}
+	timeDecoder.Initialize()
 
 	for _, track := range pc.incomingTracks {
 		var typ description.MediaType
@@ -141,13 +155,53 @@ func ToStream(
 			Formats: []format.Format{forma},
 		}
 
+		var ntpStat ntpState
+
+		if !pathConf.UseAbsoluteTimestamp {
+			ntpStat = ntpStateReplace
+		}
+
+		handleNTP := func(pkt *rtp.Packet) (time.Time, bool) {
+			switch ntpStat {
+			case ntpStateReplace:
+				return time.Time{}, true
+
+			case ntpStateInitial:
+				ntp, avail := track.PacketNTP(pkt)
+				if !avail {
+					log.Log(logger.Warn, "received RTP packet without absolute time, skipping it")
+					return time.Time{}, false
+				}
+
+				ntpStat = ntpStateAvailable
+				return ntp, true
+
+			default: // ntpStateAvailable
+				ntp, avail := track.PacketNTP(pkt)
+				if !avail {
+					panic("should not happen")
+				}
+
+				return ntp, true
+			}
+		}
+
 		track.OnPacketRTP = func(pkt *rtp.Packet) {
 			pts, ok := timeDecoder.Decode(track, pkt)
 			if !ok {
 				return
 			}
 
-			(*stream).WriteRTPPacket(medi, forma, pkt, time.Now(), pts)
+			ntp, ok := handleNTP(pkt)
+			if !ok {
+				return
+			}
+
+			(*subStream).WriteUnit(medi, forma, &unit.Unit{
+				PTS:        pts,
+				NTP:        ntp,
+				RTPPackets: []*rtp.Packet{pkt},
+			})
 		}
 
 		medias = append(medias, medi)

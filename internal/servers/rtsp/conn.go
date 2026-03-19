@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"strings"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4"
-	rtspauth "github.com/bluenviron/gortsplib/v4/pkg/auth"
-	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v5"
+	rtspauth "github.com/bluenviron/gortsplib/v5/pkg/auth"
+	"github.com/bluenviron/gortsplib/v5/pkg/base"
+	"github.com/bluenviron/gortsplib/v5/pkg/liberrors"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/auth"
@@ -17,21 +20,43 @@ import (
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/hooks"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/rtsp"
 )
 
-const (
-	rtspAuthRealm = "IPCAM"
-)
+func absoluteURL(req *base.Request, v string) string {
+	if strings.HasPrefix(v, "/") {
+		ur := base.URL{
+			Scheme: req.URL.Scheme,
+			Host:   req.URL.Host,
+			Path:   v,
+		}
+		return ur.String()
+	}
+
+	return v
+}
+
+func tunnelLabel(t gortsplib.Tunnel) string {
+	switch t {
+	case gortsplib.TunnelHTTP:
+		return "http"
+	case gortsplib.TunnelWebSocket:
+		return "websocket"
+	case gortsplib.TunnelNone:
+		return "none"
+	}
+	return "unknown"
+}
 
 type connParent interface {
 	logger.Writer
-	findSessionByRSessionUnsafe(rsession *gortsplib.ServerSession) *session
+	getSessionByRSessionUnsafe(rsession *gortsplib.ServerSession) *session
 }
 
 type conn struct {
 	isTLS               bool
 	rtspAddress         string
-	authMethods         []rtspauth.ValidateMethod
+	authMethods         []rtspauth.VerifyMethod
 	readTimeout         conf.Duration
 	runOnConnect        string
 	runOnConnectRestart bool
@@ -45,8 +70,6 @@ type conn struct {
 	uuid             uuid.UUID
 	created          time.Time
 	onDisconnectHook func()
-	authNonce        string
-	authFailures     int
 }
 
 func (c *conn) initialize() {
@@ -55,16 +78,6 @@ func (c *conn) initialize() {
 
 	c.Log(logger.Info, "opened")
 
-	desc := defs.APIPathSourceOrReader{
-		Type: func() string {
-			if c.isTLS {
-				return "rtspsConn"
-			}
-			return "rtspConn"
-		}(),
-		ID: c.uuid.String(),
-	}
-
 	c.onDisconnectHook = hooks.OnConnect(hooks.OnConnectParams{
 		Logger:              c,
 		ExternalCmdPool:     c.externalCmdPool,
@@ -72,13 +85,21 @@ func (c *conn) initialize() {
 		RunOnConnectRestart: c.runOnConnectRestart,
 		RunOnDisconnect:     c.runOnDisconnect,
 		RTSPAddress:         c.rtspAddress,
-		Desc:                desc,
+		Desc: defs.APIPathReader{
+			Type: func() string {
+				if c.isTLS {
+					return "rtspsConn"
+				}
+				return "rtspConn"
+			}(),
+			ID: c.uuid.String(),
+		},
 	})
 }
 
 // Log implements logger.Writer.
-func (c *conn) Log(level logger.Level, format string, args ...interface{}) {
-	c.parent.Log(level, "[conn %v] "+format, append([]interface{}{c.rconn.NetConn().RemoteAddr()}, args...)...)
+func (c *conn) Log(level logger.Level, format string, args ...any) {
+	c.parent.Log(level, "[conn %v] "+format, append([]any{c.rconn.NetConn().RemoteAddr()}, args...)...)
 }
 
 // Conn returns the RTSP connection.
@@ -121,39 +142,35 @@ func (c *conn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 	}
 	ctx.Path = ctx.Path[1:]
 
-	if c.authNonce == "" {
-		var err error
-		c.authNonce, err = rtspauth.GenerateNonce()
-		if err != nil {
-			return &base.Response{
-				StatusCode: base.StatusInternalServerError,
-			}, nil, err
+	// CustomVerifyFunc prevents hashed credentials from working.
+	// Use it only when strictly needed.
+	var customVerifyFunc func(expectedUser, expectedPass string) bool
+	if slices.Contains(c.authMethods, rtspauth.VerifyMethodDigestMD5) {
+		customVerifyFunc = func(expectedUser, expectedPass string) bool {
+			return c.rconn.VerifyCredentials(ctx.Request, expectedUser, expectedPass)
 		}
 	}
 
-	req := defs.PathAccessRequest{
-		Name:        ctx.Path,
-		Query:       ctx.Query,
-		IP:          c.ip(),
-		Proto:       auth.ProtocolRTSP,
-		ID:          &c.uuid,
-		RTSPRequest: ctx.Request,
-		RTSPNonce:   c.authNonce,
-	}
-	req.FillFromRTSPRequest(ctx.Request)
-
 	res := c.pathManager.Describe(defs.PathDescribeReq{
-		AccessRequest: req,
+		AccessRequest: defs.PathAccessRequest{
+			Name:             ctx.Path,
+			Query:            ctx.Query,
+			Proto:            auth.ProtocolRTSP,
+			ID:               &c.uuid,
+			Credentials:      rtsp.Credentials(ctx.Request),
+			IP:               c.ip(),
+			CustomVerifyFunc: customVerifyFunc,
+		},
 	})
 
 	if res.Err != nil {
 		var terr *auth.Error
 		if errors.As(res.Err, &terr) {
-			res, err := c.handleAuthError(terr)
-			return res, nil, err
+			res, err2 := c.handleAuthError(terr)
+			return res, nil, err2
 		}
 
-		var terr2 defs.PathNoOnePublishingError
+		var terr2 defs.PathNoStreamAvailableError
 		if errors.As(res.Err, &terr2) {
 			return &base.Response{
 				StatusCode: base.StatusNotFound,
@@ -169,64 +186,54 @@ func (c *conn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 		return &base.Response{
 			StatusCode: base.StatusMovedPermanently,
 			Header: base.Header{
-				"Location": base.HeaderValue{res.Redirect},
+				"Location": base.HeaderValue{absoluteURL(ctx.Request, res.Redirect)},
 			},
 		}, nil, nil
 	}
 
-	var stream *gortsplib.ServerStream
+	var strm *gortsplib.ServerStream
 	if !c.isTLS {
-		stream = res.Stream.RTSPStream(c.rserver)
+		strm = res.Stream.RTSPStream(c.rserver)
 	} else {
-		stream = res.Stream.RTSPSStream(c.rserver)
+		strm = res.Stream.RTSPSStream(c.rserver)
 	}
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
-	}, stream, nil
+	}, strm, nil
 }
 
-func (c *conn) handleAuthError(authErr error) (*base.Response, error) {
-	c.authFailures++
-
-	// VLC with login prompt sends 4 requests:
-	// 1) without credentials
-	// 2) with password but without username
-	// 3) without credentials
-	// 4) with password and username
-	// therefore we must allow up to 3 failures
-	if c.authFailures <= 3 {
+func (c *conn) handleAuthError(err *auth.Error) (*base.Response, error) {
+	if err.AskCredentials {
 		return &base.Response{
 			StatusCode: base.StatusUnauthorized,
-			Header: base.Header{
-				"WWW-Authenticate": rtspauth.GenerateWWWAuthenticate(c.authMethods, rtspAuthRealm, c.authNonce),
-			},
-		}, nil
+		}, liberrors.ErrServerAuth{}
 	}
 
-	// wait some seconds to mitigate brute force attacks
+	// wait some seconds to delay brute force attacks
 	<-time.After(auth.PauseAfterError)
 
 	return &base.Response{
 		StatusCode: base.StatusUnauthorized,
-	}, authErr
+	}, err
 }
 
 func (c *conn) apiItem() *defs.APIRTSPConn {
 	stats := c.rconn.Stats()
 
 	return &defs.APIRTSPConn{
-		ID:            c.uuid,
-		Created:       c.created,
-		RemoteAddr:    c.remoteAddr().String(),
-		BytesReceived: stats.BytesReceived,
-		BytesSent:     stats.BytesSent,
+		ID:         c.uuid,
+		Created:    c.created,
+		RemoteAddr: c.remoteAddr().String(),
 		Session: func() *uuid.UUID {
-			sx := c.parent.findSessionByRSessionUnsafe(c.rconn.Session())
+			sx := c.parent.getSessionByRSessionUnsafe(c.rconn.Session())
 			if sx != nil {
 				return &sx.uuid
 			}
 			return nil
 		}(),
+		Tunnel:        tunnelLabel(c.rconn.Transport().Tunnel),
+		BytesReceived: stats.BytesReceived,
+		BytesSent:     stats.BytesSent,
 	}
 }

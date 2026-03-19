@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/bluenviron/mediacommon/pkg/formats/fmp4"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/recordstore"
 	"github.com/gin-gonic/gin"
@@ -81,6 +82,21 @@ func parseSegments(segments []*recordstore.Segment) ([]*parsedSegment, error) {
 	}
 
 	return parsed, err
+}
+
+func urlScheme(ctx *gin.Context, trustedProxies conf.IPNetworks, encryption bool) string {
+	if trustedProxies.Contains(net.ParseIP(ctx.RemoteIP())) {
+		xForwardedProto := ctx.Request.Header.Get("X-Forwarded-Proto")
+		if xForwardedProto != "" {
+			return xForwardedProto
+		}
+	}
+
+	if encryption {
+		return "https"
+	}
+
+	return "http"
 }
 
 type listEntry struct {
@@ -212,12 +228,7 @@ func (s *Server) onList(ctx *gin.Context) {
 		}
 	}
 
-	var scheme string
-	if s.Encryption {
-		scheme = "https"
-	} else {
-		scheme = "http"
-	}
+	scheme := urlScheme(ctx, s.TrustedProxies, s.Encryption)
 
 	for i := range entries {
 		v := url.Values{}

@@ -3,11 +3,11 @@ package conf
 import (
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
 
+	"github.com/bluenviron/mediamtx/internal/conf/jsonwrapper"
 	"github.com/matthewhartstonge/argon2"
 )
 
@@ -27,15 +27,10 @@ func sha256Base64(in string) string {
 // Credential is a parameter that is used as username or password.
 type Credential string
 
-// MarshalJSON implements json.Marshaler.
-func (d Credential) MarshalJSON() ([]byte, error) {
-	return json.Marshal(string(d))
-}
-
 // UnmarshalJSON implements json.Unmarshaler.
 func (d *Credential) UnmarshalJSON(b []byte) error {
 	var in string
-	if err := json.Unmarshal(b, &in); err != nil {
+	if err := jsonwrapper.Unmarshal(b, &in); err != nil {
 		return err
 	}
 

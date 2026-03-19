@@ -9,14 +9,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	mcmpegts "github.com/bluenviron/mediacommon/pkg/formats/mpegts"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	srt "github.com/datarhei/gosrt"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/auth"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/hooks"
 	"github.com/bluenviron/mediamtx/internal/logger"
@@ -41,13 +41,6 @@ func srtCheckPassphrase(connReq srt.ConnRequest, passphrase string) error {
 	return nil
 }
 
-type connState int
-
-const (
-	connStateRead connState = iota + 1
-	connStatePublish
-)
-
 type conn struct {
 	parentCtx           context.Context
 	rtspAddress         string
@@ -68,7 +61,7 @@ type conn struct {
 	created   time.Time
 	uuid      uuid.UUID
 	mutex     sync.RWMutex
-	state     connState
+	state     defs.APISRTConnState
 	pathName  string
 	query     string
 	sconn     srt.Conn
@@ -79,6 +72,7 @@ func (c *conn) initialize() {
 
 	c.created = time.Now()
 	c.uuid = uuid.New()
+	c.state = defs.APISRTConnStateIdle
 
 	c.Log(logger.Info, "opened")
 
@@ -91,8 +85,8 @@ func (c *conn) Close() {
 }
 
 // Log implements logger.Writer.
-func (c *conn) Log(level logger.Level, format string, args ...interface{}) {
-	c.parent.Log(level, "[conn %v] "+format, append([]interface{}{c.connReq.RemoteAddr()}, args...)...)
+func (c *conn) Log(level logger.Level, format string, args ...any) {
+	c.parent.Log(level, "[conn %v] "+format, append([]any{c.connReq.RemoteAddr()}, args...)...)
 }
 
 func (c *conn) ip() net.IP {
@@ -109,7 +103,7 @@ func (c *conn) run() { //nolint:dupl
 		RunOnConnectRestart: c.runOnConnectRestart,
 		RunOnDisconnect:     c.runOnDisconnect,
 		RTSPAddress:         c.rtspAddress,
-		Desc:                c.APIReaderDescribe(),
+		Desc:                *c.APIReaderDescribe(),
 	})
 	defer onDisconnectHook()
 
@@ -137,23 +131,24 @@ func (c *conn) runInner() error {
 }
 
 func (c *conn) runPublish(streamID *streamID) error {
-	path, err := c.pathManager.AddPublisher(defs.PathAddPublisherReq{
-		Author: c,
+	pathConf, err := c.pathManager.FindPathConf(defs.PathFindPathConfReq{
 		AccessRequest: defs.PathAccessRequest{
 			Name:    streamID.path,
 			Query:   streamID.query,
-			IP:      c.ip(),
 			Publish: true,
-			User:    streamID.user,
-			Pass:    streamID.pass,
 			Proto:   auth.ProtocolSRT,
 			ID:      &c.uuid,
+			Credentials: &auth.Credentials{
+				User: streamID.user,
+				Pass: streamID.pass,
+			},
+			IP: c.ip(),
 		},
 	})
 	if err != nil {
 		var terr *auth.Error
 		if errors.As(err, &terr) {
-			// wait some seconds to mitigate brute force attacks
+			// wait some seconds to delay brute force attacks
 			<-time.After(auth.PauseAfterError)
 			c.connReq.Reject(srt.REJ_PEER)
 			return terr
@@ -162,9 +157,7 @@ func (c *conn) runPublish(streamID *streamID) error {
 		return err
 	}
 
-	defer path.RemovePublisher(defs.PathRemovePublisherReq{Author: c})
-
-	err = srtCheckPassphrase(c.connReq, path.SafeConf().SRTPublishPassphrase)
+	err = srtCheckPassphrase(c.connReq, pathConf.SRTPublishPassphrase)
 	if err != nil {
 		c.connReq.Reject(srt.REJ_PEER)
 		return err
@@ -175,20 +168,13 @@ func (c *conn) runPublish(streamID *streamID) error {
 		return err
 	}
 
-	c.mutex.Lock()
-	c.state = connStatePublish
-	c.pathName = streamID.path
-	c.query = streamID.query
-	c.sconn = sconn
-	c.mutex.Unlock()
-
 	readerErr := make(chan error)
 	go func() {
-		readerErr <- c.runPublishReader(sconn, path)
+		readerErr <- c.runPublishReader(sconn, streamID, pathConf)
 	}()
 
 	select {
-	case err := <-readerErr:
+	case err = <-readerErr:
 		sconn.Close()
 		return err
 
@@ -199,34 +185,64 @@ func (c *conn) runPublish(streamID *streamID) error {
 	}
 }
 
-func (c *conn) runPublishReader(sconn srt.Conn, path defs.Path) error {
+func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *conf.Path) error {
 	sconn.SetReadDeadline(time.Now().Add(time.Duration(c.readTimeout)))
-	r, err := mcmpegts.NewReader(mcmpegts.NewBufferedReader(sconn))
+	r := &mpegts.EnhancedReader{R: sconn}
+	err := r.Initialize()
 	if err != nil {
 		return err
 	}
 
-	decodeErrLogger := logger.NewLimitedLogger(c)
+	decodeErrors := &errordumper.Dumper{
+		OnReport: func(val uint64, last error) {
+			if val == 1 {
+				c.Log(logger.Warn, "decode error: %v", last)
+			} else {
+				c.Log(logger.Warn, "%d decode errors, last was: %v", val, last)
+			}
+		},
+	}
+
+	decodeErrors.Start()
+	defer decodeErrors.Stop()
 
 	r.OnDecodeError(func(err error) {
-		decodeErrLogger.Log(logger.Warn, err.Error())
+		decodeErrors.Add(err)
 	})
 
-	var stream *stream.Stream
+	var subStream *stream.SubStream
 
-	medias, err := mpegts.ToStream(r, &stream, c)
+	medias, err := mpegts.ToStream(r, &subStream, c)
 	if err != nil {
 		return err
 	}
 
-	stream, err = path.StartPublisher(defs.PathStartPublisherReq{
-		Author:             c,
-		Desc:               &description.Session{Medias: medias},
-		GenerateRTPPackets: true,
+	var path defs.Path
+	path, subStream, err = c.pathManager.AddPublisher(defs.PathAddPublisherReq{
+		Author:        c,
+		Desc:          &description.Session{Medias: medias},
+		UseRTPPackets: false,
+		ReplaceNTP:    true,
+		ConfToCompare: pathConf,
+		AccessRequest: defs.PathAccessRequest{
+			Name:     streamID.path,
+			Query:    streamID.query,
+			Publish:  true,
+			SkipAuth: true,
+		},
 	})
 	if err != nil {
 		return err
 	}
+
+	defer path.RemovePublisher(defs.PathRemovePublisherReq{Author: c})
+
+	c.mutex.Lock()
+	c.state = defs.APISRTConnStatePublish
+	c.pathName = streamID.path
+	c.query = streamID.query
+	c.sconn = sconn
+	c.mutex.Unlock()
 
 	for {
 		err = r.Read()
@@ -237,22 +253,24 @@ func (c *conn) runPublishReader(sconn srt.Conn, path defs.Path) error {
 }
 
 func (c *conn) runRead(streamID *streamID) error {
-	path, stream, err := c.pathManager.AddReader(defs.PathAddReaderReq{
+	path, strm, err := c.pathManager.AddReader(defs.PathAddReaderReq{
 		Author: c,
 		AccessRequest: defs.PathAccessRequest{
 			Name:  streamID.path,
 			Query: streamID.query,
-			IP:    c.ip(),
-			User:  streamID.user,
-			Pass:  streamID.pass,
 			Proto: auth.ProtocolSRT,
 			ID:    &c.uuid,
+			Credentials: &auth.Credentials{
+				User: streamID.user,
+				Pass: streamID.pass,
+			},
+			IP: c.ip(),
 		},
 	})
 	if err != nil {
 		var terr *auth.Error
 		if errors.As(err, &terr) {
-			// wait some seconds to mitigate brute force attacks
+			// wait some seconds to delay brute force attacks
 			<-time.After(auth.PauseAfterError)
 			c.connReq.Reject(srt.REJ_PEER)
 			return terr
@@ -275,29 +293,31 @@ func (c *conn) runRead(streamID *streamID) error {
 	}
 	defer sconn.Close()
 
+	bw := bufio.NewWriterSize(sconn, srtMaxPayloadSize(c.udpMaxPayloadSize))
+
+	r := &stream.Reader{Parent: c}
+
+	err = mpegts.FromStream(strm.Desc, r, bw, sconn, time.Duration(c.writeTimeout))
+	if err != nil {
+		return err
+	}
+
 	c.mutex.Lock()
-	c.state = connStateRead
+	c.state = defs.APISRTConnStateRead
 	c.pathName = streamID.path
 	c.query = streamID.query
 	c.sconn = sconn
 	c.mutex.Unlock()
 
-	bw := bufio.NewWriterSize(sconn, srtMaxPayloadSize(c.udpMaxPayloadSize))
-
-	err = mpegts.FromStream(stream, c, bw, sconn, time.Duration(c.writeTimeout))
-	if err != nil {
-		return err
-	}
-
 	c.Log(logger.Info, "is reading from path '%s', %s",
-		path.Name(), defs.FormatsInfo(stream.ReaderFormats(c)))
+		path.Name(), defs.FormatsInfo(r.Formats()))
 
 	onUnreadHook := hooks.OnRead(hooks.OnReadParams{
 		Logger:          c,
 		ExternalCmdPool: c.externalCmdPool,
 		Conf:            path.SafeConf(),
 		ExternalCmdEnv:  path.ExternalCmdEnv(),
-		Reader:          c.APIReaderDescribe(),
+		Reader:          *c.APIReaderDescribe(),
 		Query:           streamID.query,
 	})
 	defer onUnreadHook()
@@ -305,29 +325,32 @@ func (c *conn) runRead(streamID *streamID) error {
 	// disable read deadline
 	sconn.SetReadDeadline(time.Time{})
 
-	stream.StartReader(c)
-	defer stream.RemoveReader(c)
+	strm.AddReader(r)
+	defer strm.RemoveReader(r)
 
 	select {
 	case <-c.ctx.Done():
 		return fmt.Errorf("terminated")
 
-	case err = <-stream.ReaderError(c):
+	case err = <-r.Error():
 		return err
 	}
 }
 
 // APIReaderDescribe implements reader.
-func (c *conn) APIReaderDescribe() defs.APIPathSourceOrReader {
-	return defs.APIPathSourceOrReader{
+func (c *conn) APIReaderDescribe() *defs.APIPathReader {
+	return &defs.APIPathReader{
 		Type: "srtConn",
 		ID:   c.uuid.String(),
 	}
 }
 
 // APISourceDescribe implements source.
-func (c *conn) APISourceDescribe() defs.APIPathSourceOrReader {
-	return c.APIReaderDescribe()
+func (c *conn) APISourceDescribe() *defs.APIPathSource {
+	return &defs.APIPathSource{
+		Type: "srtConn",
+		ID:   c.uuid.String(),
+	}
 }
 
 func (c *conn) apiItem() *defs.APISRTConn {
@@ -338,20 +361,9 @@ func (c *conn) apiItem() *defs.APISRTConn {
 		ID:         c.uuid,
 		Created:    c.created,
 		RemoteAddr: c.connReq.RemoteAddr().String(),
-		State: func() defs.APISRTConnState {
-			switch c.state {
-			case connStateRead:
-				return defs.APISRTConnStateRead
-
-			case connStatePublish:
-				return defs.APISRTConnStatePublish
-
-			default:
-				return defs.APISRTConnStateIdle
-			}
-		}(),
-		Path:  c.pathName,
-		Query: c.query,
+		State:      c.state,
+		Path:       c.pathName,
+		Query:      c.query,
 	}
 
 	if c.sconn != nil {

@@ -1,12 +1,12 @@
 package conf
 
 import (
-	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
 
 	"github.com/bluenviron/mediamtx/internal/conf/env"
+	"github.com/bluenviron/mediamtx/internal/conf/jsonwrapper"
 )
 
 var optionalPathValuesType = func() reflect.Type {
@@ -14,7 +14,7 @@ var optionalPathValuesType = func() reflect.Type {
 	rt := reflect.TypeOf(Path{})
 	nf := rt.NumField()
 
-	for i := 0; i < nf; i++ {
+	for i := range nf {
 		f := rt.Field(i)
 		j := f.Tag.Get("json")
 
@@ -39,21 +39,19 @@ var optionalPathValuesType = func() reflect.Type {
 	return reflect.StructOf(fields)
 }()
 
-func newOptionalPathValues() interface{} {
+func newOptionalPathValues() any {
 	return reflect.New(optionalPathValuesType).Interface()
 }
 
 // OptionalPath is a Path whose values can all be optional.
 type OptionalPath struct {
-	Values interface{}
+	Values any
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (p *OptionalPath) UnmarshalJSON(b []byte) error {
 	p.Values = newOptionalPathValues()
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.DisallowUnknownFields()
-	return d.Decode(p.Values)
+	return jsonwrapper.Unmarshal(b, p.Values)
 }
 
 // UnmarshalEnv implements env.Unmarshaler.

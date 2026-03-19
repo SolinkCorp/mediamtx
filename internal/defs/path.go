@@ -3,21 +3,21 @@ package defs
 import (
 	"fmt"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
-// PathNoOnePublishingError is returned when no one is publishing.
-type PathNoOnePublishingError struct {
+// PathNoStreamAvailableError is returned when no one is publishing.
+type PathNoStreamAvailableError struct {
 	PathName string
 }
 
 // Error implements the error interface.
-func (e PathNoOnePublishingError) Error() string {
-	return fmt.Sprintf("no one is publishing to path '%s'", e.PathName)
+func (e PathNoStreamAvailableError) Error() string {
+	return fmt.Sprintf("no stream is available on path '%s'", e.PathName)
 }
 
 // Path is a path.
@@ -25,8 +25,6 @@ type Path interface {
 	Name() string
 	SafeConf() *conf.Path
 	ExternalCmdEnv() externalcmd.Environment
-	StartPublisher(req PathStartPublisherReq) (*stream.Stream, error)
-	StopPublisher(req PathStopPublisherReq)
 	RemovePublisher(req PathRemovePublisherReq)
 	RemoveReader(req PathRemoveReaderReq)
 }
@@ -59,39 +57,24 @@ type PathDescribeReq struct {
 
 // PathAddPublisherRes contains the response of AddPublisher().
 type PathAddPublisherRes struct {
-	Path Path
-	Err  error
+	Path      Path
+	SubStream *stream.SubStream
+	Err       error
 }
 
 // PathAddPublisherReq contains arguments of AddPublisher().
 type PathAddPublisherReq struct {
 	Author        Publisher
+	Desc          *description.Session
+	UseRTPPackets bool
+	ReplaceNTP    bool
+	ConfToCompare *conf.Path
 	AccessRequest PathAccessRequest
 	Res           chan PathAddPublisherRes
 }
 
 // PathRemovePublisherReq contains arguments of RemovePublisher().
 type PathRemovePublisherReq struct {
-	Author Publisher
-	Res    chan struct{}
-}
-
-// PathStartPublisherRes contains the response of StartPublisher().
-type PathStartPublisherRes struct {
-	Stream *stream.Stream
-	Err    error
-}
-
-// PathStartPublisherReq contains arguments of StartPublisher().
-type PathStartPublisherReq struct {
-	Author             Publisher
-	Desc               *description.Session
-	GenerateRTPPackets bool
-	Res                chan PathStartPublisherRes
-}
-
-// PathStopPublisherReq contains arguments of StopPublisher().
-type PathStopPublisherReq struct {
 	Author Publisher
 	Res    chan struct{}
 }
@@ -116,17 +99,18 @@ type PathRemoveReaderReq struct {
 	Res    chan struct{}
 }
 
-// PathSourceStaticSetReadyRes contains the response of SetReadu().
+// PathSourceStaticSetReadyRes contains the response of SetReady().
 type PathSourceStaticSetReadyRes struct {
-	Stream *stream.Stream
-	Err    error
+	SubStream *stream.SubStream
+	Err       error
 }
 
 // PathSourceStaticSetReadyReq contains arguments of SetReady().
 type PathSourceStaticSetReadyReq struct {
-	Desc               *description.Session
-	GenerateRTPPackets bool
-	Res                chan PathSourceStaticSetReadyRes
+	Desc          *description.Session
+	UseRTPPackets bool
+	ReplaceNTP    bool
+	Res           chan PathSourceStaticSetReadyRes
 }
 
 // PathSourceStaticSetNotReadyReq contains arguments of SetNotReady().

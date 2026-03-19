@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4"
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v5"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/mediamtx/internal/test"
 	"github.com/stretchr/testify/require"
 )
@@ -34,7 +34,8 @@ func TestCoreErrors(t *testing.T) {
 		{
 			"logger",
 			"logDestinations: [file]\n" +
-				"logFile: /nonexisting/nonexist\n",
+				"logFile: /nonexisting/nonexist\n" +
+				"sysLogPrefix: /mediamtx\n",
 		},
 		{
 			"metrics",
@@ -130,4 +131,24 @@ func TestCoreHotReloading(t *testing.T) {
 		require.NoError(t, err)
 		defer conn.Close()
 	}()
+}
+
+func TestCoreHotReloadingAndLoggerError(t *testing.T) {
+	confPath := filepath.Join(os.TempDir(), "rtsp-conf")
+
+	err := os.WriteFile(confPath, []byte(""),
+		0o644)
+	require.NoError(t, err)
+	defer os.Remove(confPath)
+
+	p, ok := New([]string{confPath})
+	require.Equal(t, true, ok)
+	defer p.Close()
+
+	err = os.WriteFile(confPath, []byte("logDestinations: [file]\n"+
+		"logFile: /nonexisting/nonexist\n"),
+		0o644)
+	require.NoError(t, err)
+
+	p.Wait()
 }

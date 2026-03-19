@@ -17,7 +17,7 @@ var pathCases = []struct {
 		"standard",
 		"%path/%Y-%m-%d_%H-%M-%S-%f.mp4",
 		Path{
-			Start: time.Date(2008, 11, 0o7, 11, 22, 4, 123456000, time.Local),
+			Start: time.Date(2008, 11, 7, 11, 22, 4, 123456000, time.Local),
 			Path:  "mypath",
 		},
 		"mypath/2008-11-07_11-22-04-123456.mp4",
@@ -30,6 +30,42 @@ var pathCases = []struct {
 			Path:  "mypath",
 		},
 		"mypath/1638447323.mp4",
+	},
+	{
+		"unix microseconds",
+		"%path/%s.%f.mp4",
+		Path{
+			Start: time.Date(2021, 12, 2, 12, 15, 23, 567324000, time.UTC).Local(),
+			Path:  "mypath",
+		},
+		"mypath/1638447323.567324.mp4",
+	},
+	{
+		"timezone utc",
+		"%path/%Y-%m-%d_%H-%M-%S-%f_%z.mp4",
+		Path{
+			Start: time.Date(2021, 12, 2, 12, 15, 23, 567324000, time.UTC),
+			Path:  "mypath",
+		},
+		"mypath/2021-12-02_12-15-23-567324_Z.mp4",
+	},
+	{
+		"timezone plus",
+		"%path/%Y-%m-%d_%H-%M-%S-%f_%z.mp4",
+		Path{
+			Start: time.Date(2021, 12, 2, 12, 15, 23, 567324000, time.FixedZone("myzone", 7200)),
+			Path:  "mypath",
+		},
+		"mypath/2021-12-02_12-15-23-567324_+0200.mp4",
+	},
+	{
+		"timezone minus",
+		"%path/%Y-%m-%d_%H-%M-%S-%f_%z.mp4",
+		Path{
+			Start: time.Date(2021, 12, 2, 12, 15, 23, 567324000, time.FixedZone("myzone", -7200)),
+			Path:  "mypath",
+		},
+		"mypath/2021-12-02_12-15-23-567324_-0200.mp4",
 	},
 }
 

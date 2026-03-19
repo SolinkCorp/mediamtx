@@ -5,18 +5,29 @@ on:
     tags:
     - 'v*'
 
+permissions:
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+  contents: write
+  issues: write
+
 jobs:
   binaries:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - run: make binaries
-      env:
-        CHECKSUM: '1'
 
-    - uses: actions/upload-artifact@v4
+    - run: cd binaries && sha256sum -b * > checksums.sha256
+
+    - uses: actions/attest@v4
+      with:
+        subject-path: '${{ github.workspace }}/binaries/*'
+
+    - uses: actions/upload-artifact@v7
       with:
         name: binaries
         path: binaries
@@ -26,12 +37,12 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v8
       with:
         name: binaries
         path: binaries
 
-    - uses: actions/github-script@v6
+    - uses: actions/github-script@v8
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
@@ -40,21 +51,30 @@ jobs:
 
           const currentRelease = context.ref.split('/')[2];
 
-          let body = `## New major features\n\n`
-            + `TODO\n\n`
-            + `## Fixes and improvements\n\n`
-            + `TODO\n\n`
-            + `## Security\n\n`
-            + `Binaries have been produced by the [Release workflow](https://github.com/${owner}/${repo}/actions/workflows/release.yml)`
-            + ` without human intervention.\n\n`
-            + `SHA256 checksums:\n\n`;
-
-          for (const name of await fs.readdir('./binaries/')) {
-            if (name.endsWith('.sha256sum')) {
-              const parts = (await fs.readFile(`./binaries/${name}`, 'utf-8')).slice(0, -1).split(' ');
-              body += `* ${parts[2]} ${parts[0]}\n`;
-            }
-          }
+          let body = `## New major features\n`
+            + `\n`
+            + `TODO\n`
+            + `\n`
+            + `## Fixes and improvements\n`
+            + `\n`
+            + `TODO\n`
+            + `\n`
+            + `## Security\n`
+            + `\n`
+            + `Binaries are compiled from source code by the [Release workflow](https://github.com/${owner}/${repo}/actions/workflows/release.yml) without human intervention.\n`
+            + `\n`
+            + 'You can verify that binaries have been produced by the workflow by using [GitHub Attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations):\n'
+            + `\n`
+            + '```\n'
+            + `ls mediamtx_* | xargs -L1 gh attestation verify --repo bluenviron/mediamtx\n`
+            + '```\n'
+            + `\n`
+            + 'You can verify checksums of binaries by downloading `checksums.sha256` and running:\n'
+            + `\n`
+            + '```\n'
+            + `cat checksums.sha256 | grep "$(ls mediamtx_*)" | sha256sum --check\n`
+            + '```\n'
+            + `\n`;
 
           const res = await github.rest.repos.createRelease({
             owner,
@@ -80,7 +100,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/github-script@v6
+    - uses: actions/github-script@v8
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
@@ -117,7 +137,9 @@ jobs:
                 body: `This issue is mentioned in release ${curTag.name} 🚀\n`
                   + `Check out the entire changelog by [clicking here](https://github.com/${owner}/${repo}/releases/tag/${curTag.name})`,
               });
-            } catch (exc) {}
+            } catch (exc) {
+              console.error(exc.toString());
+            }
           }
 
   dockerhub:
@@ -125,9 +147,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v8
       with:
         name: binaries
         path: binaries
@@ -136,31 +158,3 @@ jobs:
       env:
         DOCKER_USER: ${{ secrets.DOCKER_USER }}
         DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-
-  dockerhub_legacy:
-    needs: dockerhub
-    runs-on: ubuntu-22.04
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - run: make dockerhub-legacy
-      env:
-        DOCKER_USER_LEGACY: ${{ secrets.DOCKER_USER_LEGACY }}
-        DOCKER_PASSWORD_LEGACY: ${{ secrets.DOCKER_PASSWORD_LEGACY }}
-
-  api_docs:
-    needs: binaries
-    runs-on: ubuntu-22.04
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - run: make apidocs
-
-    - run: mv apidocs/*.html apidocs/index.html
-
-    - uses: peaceiris/actions-gh-pages@v3
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./apidocs

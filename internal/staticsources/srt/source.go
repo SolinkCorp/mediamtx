@@ -4,25 +4,31 @@ package srt
 import (
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	mcmpegts "github.com/bluenviron/mediacommon/pkg/formats/mpegts"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	srt "github.com/datarhei/gosrt"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/mpegts"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
+type parent interface {
+	logger.Writer
+	SetReady(req defs.PathSourceStaticSetReadyReq) defs.PathSourceStaticSetReadyRes
+	SetNotReady(req defs.PathSourceStaticSetNotReadyReq)
+}
+
 // Source is a SRT static source.
 type Source struct {
 	ReadTimeout conf.Duration
-	Parent      defs.StaticSourceParent
+	Parent      parent
 }
 
 // Log implements logger.Writer.
-func (s *Source) Log(level logger.Level, format string, args ...interface{}) {
+func (s *Source) Log(level logger.Level, format string, args ...any) {
 	s.Parent.Log(level, "[SRT source] "+format, args...)
 }
 
@@ -53,7 +59,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 
 	for {
 		select {
-		case err := <-readDone:
+		case err = <-readDone:
 			sconn.Close()
 			return err
 
@@ -69,37 +75,52 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 
 func (s *Source) runReader(sconn srt.Conn) error {
 	sconn.SetReadDeadline(time.Now().Add(time.Duration(s.ReadTimeout)))
-	r, err := mcmpegts.NewReader(mcmpegts.NewBufferedReader(sconn))
+	r := &mpegts.EnhancedReader{R: sconn}
+	err := r.Initialize()
 	if err != nil {
 		return err
 	}
 
-	decodeErrLogger := logger.NewLimitedLogger(s)
+	decodeErrors := &errordumper.Dumper{
+		OnReport: func(val uint64, last error) {
+			if val == 1 {
+				s.Log(logger.Warn, "decode error: %v", last)
+			} else {
+				s.Log(logger.Warn, "%d decode errors, last was: %v", val, last)
+			}
+		},
+	}
+
+	decodeErrors.Start()
+	defer decodeErrors.Stop()
 
 	r.OnDecodeError(func(err error) {
-		decodeErrLogger.Log(logger.Warn, err.Error())
+		decodeErrors.Add(err)
 	})
 
-	var stream *stream.Stream
+	var subStream *stream.SubStream
 
-	medias, err := mpegts.ToStream(r, &stream, s)
+	medias, err := mpegts.ToStream(r, &subStream, s)
 	if err != nil {
 		return err
 	}
 
 	res := s.Parent.SetReady(defs.PathSourceStaticSetReadyReq{
-		Desc:               &description.Session{Medias: medias},
-		GenerateRTPPackets: true,
+		Desc:          &description.Session{Medias: medias},
+		UseRTPPackets: false,
+		ReplaceNTP:    true,
 	})
 	if res.Err != nil {
 		return res.Err
 	}
 
-	stream = res.Stream
+	defer s.Parent.SetNotReady(defs.PathSourceStaticSetNotReadyReq{})
+
+	subStream = res.SubStream
 
 	for {
 		sconn.SetReadDeadline(time.Now().Add(time.Duration(s.ReadTimeout)))
-		err := r.Read()
+		err = r.Read()
 		if err != nil {
 			return err
 		}
@@ -107,8 +128,8 @@ func (s *Source) runReader(sconn srt.Conn) error {
 }
 
 // APISourceDescribe implements StaticSource.
-func (*Source) APISourceDescribe() defs.APIPathSourceOrReader {
-	return defs.APIPathSourceOrReader{
+func (*Source) APISourceDescribe() *defs.APIPathSource {
+	return &defs.APIPathSource{
 		Type: "srtSource",
 		ID:   "",
 	}

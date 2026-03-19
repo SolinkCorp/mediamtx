@@ -1,10 +1,11 @@
 package conf
 
 import (
-	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
+
+	"github.com/bluenviron/mediamtx/internal/conf/jsonwrapper"
 )
 
 var optionalGlobalValuesType = func() reflect.Type {
@@ -12,7 +13,7 @@ var optionalGlobalValuesType = func() reflect.Type {
 	rt := reflect.TypeOf(Conf{})
 	nf := rt.NumField()
 
-	for i := 0; i < nf; i++ {
+	for i := range nf {
 		f := rt.Field(i)
 		j := f.Tag.Get("json")
 
@@ -37,21 +38,19 @@ var optionalGlobalValuesType = func() reflect.Type {
 	return reflect.StructOf(fields)
 }()
 
-func newOptionalGlobalValues() interface{} {
+func newOptionalGlobalValues() any {
 	return reflect.New(optionalGlobalValuesType).Interface()
 }
 
 // OptionalGlobal is a Conf whose values can all be optional.
 type OptionalGlobal struct {
-	Values interface{}
+	Values any
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (p *OptionalGlobal) UnmarshalJSON(b []byte) error {
 	p.Values = newOptionalGlobalValues()
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.DisallowUnknownFields()
-	return d.Decode(p.Values)
+	return jsonwrapper.Unmarshal(b, p.Values)
 }
 
 // MarshalJSON implements json.Marshaler.

@@ -13,168 +13,121 @@ import (
 	"github.com/pion/sdp/v3"
 	pwebrtc "github.com/pion/webrtc/v4"
 
-	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 )
 
-const (
-	handshakeTimeout   = 10 * time.Second
-	trackGatherTimeout = 2 * time.Second
-)
-
 // Client is a WHIP client.
 type Client struct {
-	HTTPClient *http.Client
-	URL        *url.URL
-	Log        logger.Writer
+	URL                *url.URL
+	Publish            bool
+	OutgoingTracks     []*webrtc.OutgoingTrack
+	HTTPClient         *http.Client
+	BearerToken        string
+	UDPReadBufferSize  uint
+	STUNGatherTimeout  time.Duration
+	HandshakeTimeout   time.Duration
+	TrackGatherTimeout time.Duration
+	Log                logger.Writer
 
 	pc               *webrtc.PeerConnection
 	patchIsSupported bool
 }
 
-// Publish publishes tracks.
-func (c *Client) Publish(
-	ctx context.Context,
-	outgoingTracks []*webrtc.OutgoingTrack,
-) error {
+// Initialize initializes the Client.
+func (c *Client) Initialize(ctx context.Context) error {
+	if c.STUNGatherTimeout == 0 {
+		c.STUNGatherTimeout = 5 * time.Second
+	}
+	if c.HandshakeTimeout == 0 {
+		c.HandshakeTimeout = 10 * time.Second
+	}
+	if c.TrackGatherTimeout == 0 {
+		c.TrackGatherTimeout = 2 * time.Second
+	}
+
 	iceServers, err := c.optionsICEServers(ctx)
 	if err != nil {
 		return err
 	}
 
 	c.pc = &webrtc.PeerConnection{
-		ICEServers:         iceServers,
-		HandshakeTimeout:   conf.Duration(10 * time.Second),
-		TrackGatherTimeout: conf.Duration(2 * time.Second),
-		LocalRandomUDP:     true,
-		IPsFromInterfaces:  true,
-		Publish:            true,
-		OutgoingTracks:     outgoingTracks,
-		Log:                c.Log,
+		UDPReadBufferSize: c.UDPReadBufferSize,
+		LocalRandomUDP:    true,
+		ICEServers:        iceServers,
+		IPsFromInterfaces: true,
+		Publish:           c.Publish,
+		STUNGatherTimeout: c.STUNGatherTimeout,
+		OutgoingTracks:    c.OutgoingTracks,
+		Log:               c.Log,
 	}
 	err = c.pc.Start()
 	if err != nil {
 		return err
 	}
 
-	offer, err := c.pc.CreatePartialOffer()
+	initializeRes := make(chan error)
+
+	go func() {
+		initializeRes <- c.initializeInner(ctx)
+	}()
+
+	select {
+	case <-ctx.Done():
+		c.pc.Close()
+		<-initializeRes
+		return fmt.Errorf("terminated")
+
+	case err = <-initializeRes:
+	}
+
 	if err != nil {
 		c.pc.Close()
 		return err
-	}
-
-	res, err := c.postOffer(ctx, offer)
-	if err != nil {
-		c.pc.Close()
-		return err
-	}
-
-	c.URL, err = c.URL.Parse(res.Location)
-	if err != nil {
-		c.pc.Close()
-		return err
-	}
-
-	err = c.pc.SetAnswer(res.Answer)
-	if err != nil {
-		c.deleteSession(context.Background()) //nolint:errcheck
-		c.pc.Close()
-		return err
-	}
-
-	t := time.NewTimer(handshakeTimeout)
-	defer t.Stop()
-
-outer:
-	for {
-		select {
-		case ca := <-c.pc.NewLocalCandidate():
-			err := c.patchCandidate(ctx, offer, res.ETag, ca)
-			if err != nil {
-				c.deleteSession(context.Background()) //nolint:errcheck
-				c.pc.Close()
-				return err
-			}
-
-		case <-c.pc.GatheringDone():
-
-		case <-c.pc.Ready():
-			break outer
-
-		case <-t.C:
-			c.deleteSession(context.Background()) //nolint:errcheck
-			c.pc.Close()
-			return fmt.Errorf("deadline exceeded while waiting connection")
-		}
 	}
 
 	return nil
 }
 
-// Read reads tracks.
-func (c *Client) Read(ctx context.Context) ([]*webrtc.IncomingTrack, error) {
-	iceServers, err := c.optionsICEServers(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	c.pc = &webrtc.PeerConnection{
-		ICEServers:         iceServers,
-		HandshakeTimeout:   conf.Duration(10 * time.Second),
-		TrackGatherTimeout: conf.Duration(2 * time.Second),
-		LocalRandomUDP:     true,
-		IPsFromInterfaces:  true,
-		Publish:            false,
-		Log:                c.Log,
-	}
-	err = c.pc.Start()
-	if err != nil {
-		return nil, err
-	}
-
+func (c *Client) initializeInner(ctx context.Context) error {
 	offer, err := c.pc.CreatePartialOffer()
 	if err != nil {
-		c.pc.Close()
-		return nil, err
+		return err
 	}
 
 	res, err := c.postOffer(ctx, offer)
 	if err != nil {
-		c.pc.Close()
-		return nil, err
+		return err
 	}
 
 	c.URL, err = c.URL.Parse(res.Location)
 	if err != nil {
-		c.pc.Close()
-		return nil, err
+		return err
 	}
 
-	var sdp sdp.SessionDescription
-	err = sdp.Unmarshal([]byte(res.Answer.SDP))
-	if err != nil {
-		c.deleteSession(context.Background()) //nolint:errcheck
-		c.pc.Close()
-		return nil, err
-	}
+	if !c.Publish {
+		var sdp sdp.SessionDescription
+		err = sdp.Unmarshal([]byte(res.Answer.SDP))
+		if err != nil {
+			c.deleteSession(context.Background()) //nolint:errcheck
+			return err
+		}
 
-	err = webrtc.TracksAreValid(sdp.MediaDescriptions)
-	if err != nil {
-		c.deleteSession(context.Background()) //nolint:errcheck
-		c.pc.Close()
-		return nil, err
+		err = webrtc.TracksAreValid(sdp.MediaDescriptions)
+		if err != nil {
+			c.deleteSession(context.Background()) //nolint:errcheck
+			return err
+		}
 	}
 
 	err = c.pc.SetAnswer(res.Answer)
 	if err != nil {
 		c.deleteSession(context.Background()) //nolint:errcheck
-		c.pc.Close()
-		return nil, err
+		return err
 	}
 
-	t := time.NewTimer(handshakeTimeout)
+	t := time.NewTimer(c.HandshakeTimeout)
 	defer t.Stop()
 
 outer:
@@ -184,35 +137,39 @@ outer:
 			err = c.patchCandidate(ctx, offer, res.ETag, ca)
 			if err != nil {
 				c.deleteSession(context.Background()) //nolint:errcheck
-				c.pc.Close()
-				return nil, err
+				return err
 			}
 
 		case <-c.pc.GatheringDone():
 
-		case <-c.pc.Ready():
+		case <-c.pc.Connected():
 			break outer
 
 		case <-t.C:
 			c.deleteSession(context.Background()) //nolint:errcheck
-			c.pc.Close()
-			return nil, fmt.Errorf("deadline exceeded while waiting connection")
+			return fmt.Errorf("deadline exceeded while waiting connection")
 		}
 	}
 
-	tracks, err := c.pc.GatherIncomingTracks(ctx)
-	if err != nil {
-		c.deleteSession(context.Background()) //nolint:errcheck
-		c.pc.Close()
-		return nil, err
+	if !c.Publish {
+		err = c.pc.GatherIncomingTracks(c.TrackGatherTimeout)
+		if err != nil {
+			c.deleteSession(context.Background()) //nolint:errcheck
+			return err
+		}
 	}
 
-	return tracks, nil
+	return nil
 }
 
 // PeerConnection returns the underlying peer connection.
 func (c *Client) PeerConnection() *webrtc.PeerConnection {
 	return c.pc
+}
+
+// IncomingTracks returns incoming tracks.
+func (c *Client) IncomingTracks() []*webrtc.IncomingTrack {
+	return c.pc.IncomingTracks()
 }
 
 // StartReading starts reading all incoming tracks.
@@ -227,15 +184,10 @@ func (c *Client) Close() error {
 	return err
 }
 
-// Wait waits for client errors.
-func (c *Client) Wait(ctx context.Context) error {
-	select {
-	case <-c.pc.Failed():
-		return fmt.Errorf("peer connection closed")
-
-	case <-ctx.Done():
-		return fmt.Errorf("terminated")
-	}
+// Wait waits until a fatal error.
+func (c *Client) Wait() error {
+	<-c.pc.Failed()
+	return fmt.Errorf("peer connection closed")
 }
 
 func (c *Client) optionsICEServers(
@@ -244,6 +196,10 @@ func (c *Client) optionsICEServers(
 	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, c.URL.String(), nil)
 	if err != nil {
 		return nil, err
+	}
+
+	if c.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
 	}
 
 	res, err := c.HTTPClient.Do(req)
@@ -272,6 +228,10 @@ func (c *Client) postOffer(
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL.String(), bytes.NewReader([]byte(offer.SDP)))
 	if err != nil {
 		return nil, err
+	}
+
+	if c.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
 	}
 
 	req.Header.Set("Content-Type", "application/sdp")
@@ -337,6 +297,10 @@ func (c *Client) patchCandidate(
 		return err
 	}
 
+	if c.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
+	}
+
 	req.Header.Set("Content-Type", "application/trickle-ice-sdpfrag")
 	req.Header.Set("If-Match", etag)
 
@@ -359,6 +323,10 @@ func (c *Client) deleteSession(
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.URL.String(), nil)
 	if err != nil {
 		return err
+	}
+
+	if c.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
 	}
 
 	res, err := c.HTTPClient.Do(req)

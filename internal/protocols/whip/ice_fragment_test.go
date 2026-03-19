@@ -7,12 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func uint16Ptr(v uint16) *uint16 {
-	return &v
-}
-
-func stringPtr(v string) *string {
-	return &v
+func ptrOf[T any](v T) *T {
+	p := new(T)
+	*p = v
+	return p
 }
 
 var iceFragmentCases = []struct {
@@ -176,8 +174,8 @@ var iceFragmentCases = []struct {
 			"a=sendrecv\n",
 		[]*webrtc.ICECandidateInit{{
 			Candidate:     "3628911098 1 udp 2130706431 192.168.3.218 49462 typ host",
-			SDPMid:        stringPtr("0"),
-			SDPMLineIndex: uint16Ptr(0),
+			SDPMid:        ptrOf("0"),
+			SDPMLineIndex: ptrOf(uint16(0)),
 		}},
 		"a=ice-ufrag:tUQMzoQAVLzlvBys\r\n" +
 			"a=ice-pwd:pimyGfJcjjRwvUjnmGOODSjtIxyDljQj\r\n" +

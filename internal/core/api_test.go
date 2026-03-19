@@ -8,23 +8,24 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4"
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	"github.com/bluenviron/mediacommon/pkg/formats/mpegts"
+	"github.com/bluenviron/gortmplib"
+	rtmpcodecs "github.com/bluenviron/gortmplib/pkg/codecs"
+	"github.com/bluenviron/gortsplib/v5"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts"
+	tscodecs "github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/codecs"
 	srt "github.com/datarhei/gosrt"
 	"github.com/google/uuid"
 	"github.com/pion/rtp"
 	pwebrtc "github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bluenviron/mediamtx/internal/protocols/rtmp"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
 	"github.com/bluenviron/mediamtx/internal/test"
@@ -34,7 +35,7 @@ func checkClose(t *testing.T, closeFunc func() error) {
 	require.NoError(t, closeFunc())
 }
 
-func httpRequest(t *testing.T, hc *http.Client, method string, ur string, in interface{}, out interface{}) {
+func httpRequest(t *testing.T, hc *http.Client, method string, ur string, in any, out any) {
 	buf := func() io.Reader {
 		if in == nil {
 			return nil
@@ -66,10 +67,10 @@ func httpRequest(t *testing.T, hc *http.Client, method string, ur string, in int
 }
 
 func checkError(t *testing.T, msg string, body io.Reader) {
-	var resErr map[string]interface{}
+	var resErr map[string]any
 	err := json.NewDecoder(body).Decode(&resErr)
 	require.NoError(t, err)
-	require.Equal(t, map[string]interface{}{"error": msg}, resErr)
+	require.Equal(t, map[string]any{"status": "error", "error": msg}, resErr)
 }
 
 func TestAPIPathsList(t *testing.T) {
@@ -363,25 +364,24 @@ func TestAPIProtocolListGet(t *testing.T) {
 		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
-			conf := "api: yes\n"
+			cnf := "api: yes\n"
 
 			switch ca {
 			case "rtsps conns", "rtsps sessions":
-				conf += "rtspTransports: [tcp]\n" +
-					"rtspEncryption: strict\n" +
+				cnf += "rtspEncryption: strict\n" +
 					"rtspServerCert: " + serverCertFpath + "\n" +
 					"rtspServerKey: " + serverKeyFpath + "\n"
 
 			case "rtmps":
-				conf += "rtmpEncryption: strict\n" +
+				cnf += "rtmpEncryption: strict\n" +
 					"rtmpServerCert: " + serverCertFpath + "\n" +
 					"rtmpServerKey: " + serverKeyFpath + "\n"
 			}
 
-			conf += "paths:\n" +
+			cnf += "paths:\n" +
 				"  all_others:\n"
 
-			p, ok := newInstance(conf)
+			p, ok := newInstance(cnf)
 			require.Equal(t, true, ok)
 			defer p.Close()
 
@@ -395,7 +395,7 @@ func TestAPIProtocolListGet(t *testing.T) {
 			case "rtsp conns", "rtsp sessions":
 				source := gortsplib.Client{}
 
-				err := source.StartRecording("rtsp://localhost:8554/mypath?key=val",
+				err = source.StartRecording("rtsp://localhost:8554/mypath?key=val",
 					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
@@ -405,7 +405,7 @@ func TestAPIProtocolListGet(t *testing.T) {
 					TLSConfig: &tls.Config{InsecureSkipVerify: true},
 				}
 
-				err := source.StartRecording("rtsps://localhost:8322/mypath?key=val",
+				err = source.StartRecording("rtsps://localhost:8322/mypath?key=val",
 					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
@@ -418,32 +418,51 @@ func TestAPIProtocolListGet(t *testing.T) {
 					port = "1936"
 				}
 
-				u, err := url.Parse("rtmp://127.0.0.1:" + port + "/mypath?key=val")
+				var rawURL string
+
+				if ca == "rtmps" {
+					rawURL = "rtmps://"
+				} else {
+					rawURL = "rtmp://"
+				}
+
+				rawURL += "127.0.0.1:" + port + "/mypath?key=val"
+
+				var u *url.URL
+				u, err = url.Parse(rawURL)
 				require.NoError(t, err)
 
-				nconn, err := func() (net.Conn, error) {
-					if ca == "rtmp" {
-						return net.Dial("tcp", u.Host)
-					}
-					return tls.Dial("tcp", u.Host, &tls.Config{InsecureSkipVerify: true})
-				}()
+				conn := &gortmplib.Client{
+					URL:       u,
+					TLSConfig: &tls.Config{InsecureSkipVerify: true},
+					Publish:   true,
+				}
+				err = conn.Initialize(context.Background())
 				require.NoError(t, err)
-				defer nconn.Close()
+				defer conn.Close()
 
-				conn, err := rtmp.NewClientConn(nconn, u, true)
+				track := &gortmplib.Track{
+					Codec: &rtmpcodecs.H264{
+						SPS: test.FormatH264.SPS,
+						PPS: test.FormatH264.PPS,
+					},
+				}
+
+				w := &gortmplib.Writer{
+					Conn:   conn,
+					Tracks: []*gortmplib.Track{track},
+				}
+				err = w.Initialize()
 				require.NoError(t, err)
 
-				w, err := rtmp.NewWriter(conn, test.FormatH264, nil)
-				require.NoError(t, err)
-
-				err = w.WriteH264(2*time.Second, 2*time.Second, [][]byte{{5, 2, 3, 4}})
+				err = w.WriteH264(track, 2*time.Second, 2*time.Second, [][]byte{{5, 2, 3, 4}})
 				require.NoError(t, err)
 
 				time.Sleep(500 * time.Millisecond)
 
 			case "hls":
 				source := gortsplib.Client{}
-				err := source.StartRecording("rtsp://localhost:8554/mypath",
+				err = source.StartRecording("rtsp://localhost:8554/mypath",
 					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
@@ -451,7 +470,7 @@ func TestAPIProtocolListGet(t *testing.T) {
 				go func() {
 					time.Sleep(500 * time.Millisecond)
 
-					for i := 0; i < 3; i++ {
+					for i := range 3 {
 						/*source.WritePacketRTP(medi, &rtp.Packet{
 							Header: rtp.Header{
 								Version:        2,
@@ -473,7 +492,7 @@ func TestAPIProtocolListGet(t *testing.T) {
 							0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc9, 0x20,
 						},*/
 
-						err := source.WritePacketRTP(medi, &rtp.Packet{
+						err2 := source.WritePacketRTP(medi, &rtp.Packet{
 							Header: rtp.Header{
 								Version:        2,
 								Marker:         true,
@@ -487,25 +506,26 @@ func TestAPIProtocolListGet(t *testing.T) {
 								0x05,
 							},
 						})
-						require.NoError(t, err)
+						require.NoError(t, err2)
 					}
 				}()
 
 				func() {
-					res, err := hc.Get("http://localhost:8888/mypath/index.m3u8")
-					require.NoError(t, err)
+					res, err2 := hc.Get("http://localhost:8888/mypath/index.m3u8")
+					require.NoError(t, err2)
 					defer res.Body.Close()
 					require.Equal(t, 200, res.StatusCode)
 				}()
 
 			case "webrtc":
 				source := gortsplib.Client{}
-				err := source.StartRecording("rtsp://localhost:8554/mypath",
+				err = source.StartRecording("rtsp://localhost:8554/mypath",
 					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
-				u, err := url.Parse("http://localhost:8889/mypath/whep?key=val")
+				var u *url.URL
+				u, err = url.Parse("http://localhost:8889/mypath/whep?key=val")
 				require.NoError(t, err)
 
 				go func() {
@@ -531,7 +551,7 @@ func TestAPIProtocolListGet(t *testing.T) {
 					Log:        test.NilLogger,
 				}
 
-				_, err = c.Read(context.Background())
+				err = c.Initialize(context.Background())
 				require.NoError(t, err)
 				defer checkClose(t, c.Close)
 
@@ -539,19 +559,21 @@ func TestAPIProtocolListGet(t *testing.T) {
 				conf := srt.DefaultConfig()
 				conf.StreamId = "publish:mypath:::key=val"
 
-				conn, err := srt.Dial("srt", "localhost:8890", conf)
+				var conn srt.Conn
+				conn, err = srt.Dial("srt", "localhost:8890", conf)
 				require.NoError(t, err)
 				defer conn.Close()
 
 				track := &mpegts.Track{
-					Codec: &mpegts.CodecH264{},
+					Codec: &tscodecs.H264{},
 				}
 
 				bw := bufio.NewWriter(conn)
-				w := mpegts.NewWriter(bw, []*mpegts.Track{track})
+				w := &mpegts.Writer{W: bw, Tracks: []*mpegts.Track{track}}
+				err = w.Initialize()
 				require.NoError(t, err)
 
-				err = w.WriteH2642(track, 0, 0, [][]byte{{1}})
+				err = w.WriteH264(track, 0, 0, [][]byte{{1}})
 				require.NoError(t, err)
 
 				err = bw.Flush()
@@ -590,41 +612,43 @@ func TestAPIProtocolListGet(t *testing.T) {
 				pa = "srtconns"
 			}
 
-			var out1 interface{}
+			var out1 any
 			httpRequest(t, hc, http.MethodGet, "http://localhost:9997/v3/"+pa+"/list", nil, &out1)
 
 			switch ca {
 			case "rtsp conns":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"pageCount": float64(1),
 					"itemCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
-							"bytesReceived": out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesReceived"],
-							"bytesSent":     out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
-							"remoteAddr":    out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
-							"session":       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["session"],
+					"items": []any{
+						map[string]any{
+							"bytesReceived": out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesReceived"],
+							"bytesSent":     out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
+							"remoteAddr":    out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
+							"session":       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["session"],
+							"tunnel":        "none",
 						},
 					},
 				}, out1)
 
 			case "rtsp sessions":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"pageCount": float64(1),
 					"itemCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
+					"items": []any{
+						map[string]any{
 							"bytesReceived":       float64(0),
-							"bytesSent":           out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":             out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":                  out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
+							"bytesSent":           out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":             out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":                  out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
 							"path":                "mypath",
 							"query":               "key=val",
-							"remoteAddr":          out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
+							"remoteAddr":          out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
 							"state":               "publish",
 							"transport":           "UDP",
+							"profile":             "AVP",
 							"rtpPacketsReceived":  float64(0),
 							"rtpPacketsSent":      float64(0),
 							"rtpPacketsLost":      float64(0),
@@ -633,41 +657,44 @@ func TestAPIProtocolListGet(t *testing.T) {
 							"rtcpPacketsReceived": float64(0),
 							"rtcpPacketsSent":     float64(0),
 							"rtcpPacketsInError":  float64(0),
+							"conns":               out1.(map[string]any)["items"].([]any)[0].(map[string]any)["conns"],
 						},
 					},
 				}, out1)
 
 			case "rtsps conns":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"pageCount": float64(1),
 					"itemCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
-							"bytesReceived": out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesReceived"],
-							"bytesSent":     out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
-							"remoteAddr":    out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
-							"session":       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["session"],
+					"items": []any{
+						map[string]any{
+							"bytesReceived": out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesReceived"],
+							"bytesSent":     out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
+							"remoteAddr":    out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
+							"session":       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["session"],
+							"tunnel":        "none",
 						},
 					},
 				}, out1)
 
 			case "rtsps sessions":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"pageCount": float64(1),
 					"itemCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
+					"items": []any{
+						map[string]any{
 							"bytesReceived":       float64(0),
-							"bytesSent":           out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":             out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":                  out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
+							"bytesSent":           out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":             out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":                  out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
 							"path":                "mypath",
 							"query":               "key=val",
-							"remoteAddr":          out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
+							"remoteAddr":          out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
 							"state":               "publish",
-							"transport":           "TCP",
+							"transport":           "UDP",
+							"profile":             "SAVP",
 							"rtpPacketsReceived":  float64(0),
 							"rtpPacketsSent":      float64(0),
 							"rtpPacketsLost":      float64(0),
@@ -676,87 +703,94 @@ func TestAPIProtocolListGet(t *testing.T) {
 							"rtcpPacketsReceived": float64(0),
 							"rtcpPacketsSent":     float64(0),
 							"rtcpPacketsInError":  float64(0),
+							"conns":               out1.(map[string]any)["items"].([]any)[0].(map[string]any)["conns"],
 						},
 					},
 				}, out1)
 
 			case "rtmp":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"pageCount": float64(1),
 					"itemCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
-							"bytesReceived": out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesReceived"],
-							"bytesSent":     out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
+					"items": []any{
+						map[string]any{
+							"bytesReceived": out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesReceived"],
+							"bytesSent":     out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
 							"path":          "mypath",
 							"query":         "key=val",
-							"remoteAddr":    out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
+							"remoteAddr":    out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
 							"state":         "publish",
 						},
 					},
 				}, out1)
 
 			case "rtmps":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"pageCount": float64(1),
 					"itemCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
-							"bytesReceived": out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesReceived"],
-							"bytesSent":     out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
+					"items": []any{
+						map[string]any{
+							"bytesReceived": out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesReceived"],
+							"bytesSent":     out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
 							"path":          "mypath",
 							"query":         "key=val",
-							"remoteAddr":    out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
+							"remoteAddr":    out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
 							"state":         "publish",
 						},
 					},
 				}, out1)
 
 			case "hls":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"itemCount": float64(1),
 					"pageCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
-							"bytesSent":   out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":     out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"lastRequest": out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["lastRequest"],
+					"items": []any{
+						map[string]any{
+							"bytesSent":   out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":     out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"lastRequest": out1.(map[string]any)["items"].([]any)[0].(map[string]any)["lastRequest"],
 							"path":        "mypath",
 						},
 					},
 				}, out1)
 
 			case "webrtc":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"itemCount": float64(1),
 					"pageCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
-							"bytesReceived":             out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesReceived"],
-							"bytesSent":                 out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["bytesSent"],
-							"created":                   out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":                        out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
-							"localCandidate":            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["localCandidate"],
+					"items": []any{
+						map[string]any{
+							"bytesReceived":             out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesReceived"],
+							"bytesSent":                 out1.(map[string]any)["items"].([]any)[0].(map[string]any)["bytesSent"],
+							"created":                   out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":                        out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
+							"localCandidate":            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["localCandidate"],
 							"path":                      "mypath",
 							"peerConnectionEstablished": true,
 							"query":                     "key=val",
-							"remoteAddr":                out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
-							"remoteCandidate":           out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteCandidate"],
+							"remoteAddr":                out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
+							"remoteCandidate":           out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteCandidate"],
 							"state":                     "read",
+							"rtcpPacketsReceived":       float64(0),
+							"rtcpPacketsSent":           float64(2),
+							"rtpPacketsJitter":          float64(0),
+							"rtpPacketsLost":            float64(0),
+							"rtpPacketsReceived":        float64(0),
+							"rtpPacketsSent":            float64(1),
 						},
 					},
 				}, out1)
 
 			case "srt":
-				require.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]any{
 					"itemCount": float64(1),
 					"pageCount": float64(1),
-					"items": []interface{}{
-						map[string]interface{}{
+					"items": []any{
+						map[string]any{
 							"byteMSS":                       float64(1500),
 							"bytesAvailReceiveBuf":          float64(0),
 							"bytesAvailSendBuf":             float64(0),
@@ -773,13 +807,13 @@ func TestAPIProtocolListGet(t *testing.T) {
 							"bytesSendDrop":                 float64(0),
 							"bytesSent":                     float64(0),
 							"bytesSentUnique":               float64(0),
-							"created":                       out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["created"],
-							"id":                            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"],
+							"created":                       out1.(map[string]any)["items"].([]any)[0].(map[string]any)["created"],
+							"id":                            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"],
 							"mbpsLinkCapacity":              float64(0),
 							"mbpsMaxBW":                     float64(-1),
 							"mbpsReceiveRate":               float64(0),
 							"mbpsSendRate":                  float64(0),
-							"msRTT":                         out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["msRTT"],
+							"msRTT":                         out1.(map[string]any)["items"].([]any)[0].(map[string]any)["msRTT"],
 							"msReceiveBuf":                  float64(0),
 							"msReceiveTsbPdDelay":           float64(120),
 							"msSendBuf":                     float64(0),
@@ -788,7 +822,7 @@ func TestAPIProtocolListGet(t *testing.T) {
 							"packetsFlowWindow":             float64(25600),
 							"packetsReceiveBuf":             float64(0),
 							"packetsReceived":               float64(1),
-							"packetsReceivedACK":            out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["packetsReceivedACK"],
+							"packetsReceivedACK":            out1.(map[string]any)["items"].([]any)[0].(map[string]any)["packetsReceivedACK"],
 							"packetsReceivedAvgBelatedTime": float64(0),
 							"packetsReceivedBelated":        float64(0),
 							"packetsReceivedDrop":           float64(0),
@@ -806,13 +840,13 @@ func TestAPIProtocolListGet(t *testing.T) {
 							"packetsSendLoss":               float64(0),
 							"packetsSendLossRate":           float64(0),
 							"packetsSent":                   float64(0),
-							"packetsSentACK":                out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["packetsSentACK"],
+							"packetsSentACK":                out1.(map[string]any)["items"].([]any)[0].(map[string]any)["packetsSentACK"],
 							"packetsSentKM":                 float64(0),
 							"packetsSentNAK":                float64(0),
 							"packetsSentUnique":             float64(0),
 							"path":                          "mypath",
 							"query":                         "key=val",
-							"remoteAddr":                    out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["remoteAddr"],
+							"remoteAddr":                    out1.(map[string]any)["items"].([]any)[0].(map[string]any)["remoteAddr"],
 							"state":                         "publish",
 							"usPacketsSendPeriod":           float64(10.967254638671875),
 							"usSndDuration":                 float64(0),
@@ -821,19 +855,19 @@ func TestAPIProtocolListGet(t *testing.T) {
 				}, out1)
 			}
 
-			var out2 interface{}
+			var out2 any
 
 			if ca == "hls" {
 				httpRequest(t, hc, http.MethodGet, "http://localhost:9997/v3/"+pa+"/get/"+
-					out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["path"].(string),
+					out1.(map[string]any)["items"].([]any)[0].(map[string]any)["path"].(string),
 					nil, &out2)
 			} else {
 				httpRequest(t, hc, http.MethodGet, "http://localhost:9997/v3/"+pa+"/get/"+
-					out1.(map[string]interface{})["items"].([]interface{})[0].(map[string]interface{})["id"].(string),
+					out1.(map[string]any)["items"].([]any)[0].(map[string]any)["id"].(string),
 					nil, &out2)
 			}
 
-			require.Equal(t, out1.(map[string]interface{})["items"].([]interface{})[0], out2)
+			require.Equal(t, out1.(map[string]any)["items"].([]any)[0], out2)
 		})
 	}
 }
@@ -859,25 +893,25 @@ func TestAPIProtocolGetNotFound(t *testing.T) {
 		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
-			conf := "api: yes\n"
+			cnf := "api: yes\n"
 
 			switch ca {
 			case "rtsps conns", "rtsps sessions":
-				conf += "rtspTransports: [tcp]\n" +
+				cnf += "rtspTransports: [tcp]\n" +
 					"rtspEncryption: strict\n" +
 					"rtspServerCert: " + serverCertFpath + "\n" +
 					"rtspServerKey: " + serverKeyFpath + "\n"
 
 			case "rtmps":
-				conf += "rtmpEncryption: strict\n" +
+				cnf += "rtmpEncryption: strict\n" +
 					"rtmpServerCert: " + serverCertFpath + "\n" +
 					"rtmpServerKey: " + serverKeyFpath + "\n"
 			}
 
-			conf += "paths:\n" +
+			cnf += "paths:\n" +
 				"  all_others:\n"
 
-			p, ok := newInstance(conf)
+			p, ok := newInstance(cnf)
 			require.Equal(t, true, ok)
 			defer p.Close()
 
@@ -916,10 +950,12 @@ func TestAPIProtocolGetNotFound(t *testing.T) {
 			}
 
 			func() {
-				req, err := http.NewRequest(http.MethodGet, "http://localhost:9997/v3/"+pa+"/get/"+uuid.New().String(), nil)
+				var req *http.Request
+				req, err = http.NewRequest(http.MethodGet, "http://localhost:9997/v3/"+pa+"/get/"+uuid.New().String(), nil)
 				require.NoError(t, err)
 
-				res, err := hc.Do(req)
+				var res *http.Response
+				res, err = hc.Do(req)
 				require.NoError(t, err)
 				defer res.Body.Close()
 
@@ -957,19 +993,19 @@ func TestAPIProtocolKick(t *testing.T) {
 		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
-			conf := "api: yes\n"
+			cnf := "api: yes\n"
 
 			if ca == "rtsps" {
-				conf += "rtspTransports: [tcp]\n" +
+				cnf += "rtspTransports: [tcp]\n" +
 					"rtspEncryption: strict\n" +
 					"rtspServerCert: " + serverCertFpath + "\n" +
 					"rtspServerKey: " + serverKeyFpath + "\n"
 			}
 
-			conf += "paths:\n" +
+			cnf += "paths:\n" +
 				"  all_others:\n"
 
-			p, ok := newInstance(conf)
+			p, ok := newInstance(cnf)
 			require.Equal(t, true, ok)
 			defer p.Close()
 
@@ -983,7 +1019,7 @@ func TestAPIProtocolKick(t *testing.T) {
 			case "rtsp":
 				source := gortsplib.Client{}
 
-				err := source.StartRecording("rtsp://localhost:8554/mypath",
+				err = source.StartRecording("rtsp://localhost:8554/mypath",
 					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
@@ -993,37 +1029,45 @@ func TestAPIProtocolKick(t *testing.T) {
 					TLSConfig: &tls.Config{InsecureSkipVerify: true},
 				}
 
-				err := source.StartRecording("rtsps://localhost:8322/mypath",
+				err = source.StartRecording("rtsps://localhost:8322/mypath",
 					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
 			case "rtmp":
-				u, err := url.Parse("rtmp://localhost:1935/mypath")
+				var u *url.URL
+				u, err = url.Parse("rtmp://localhost:1935/mypath")
 				require.NoError(t, err)
 
-				nconn, err := net.Dial("tcp", u.Host)
+				conn := &gortmplib.Client{
+					URL:     u,
+					Publish: true,
+				}
+				err = conn.Initialize(context.Background())
 				require.NoError(t, err)
-				defer nconn.Close()
+				defer conn.Close()
 
-				conn, err := rtmp.NewClientConn(nconn, u, true)
+				track := &gortmplib.Track{
+					Codec: &rtmpcodecs.H264{
+						SPS: test.FormatH264.SPS,
+						PPS: test.FormatH264.PPS,
+					},
+				}
+
+				w := &gortmplib.Writer{
+					Conn:   conn,
+					Tracks: []*gortmplib.Track{track},
+				}
+				err = w.Initialize()
 				require.NoError(t, err)
 
-				w, err := rtmp.NewWriter(conn, test.FormatH264, nil)
-				require.NoError(t, err)
-
-				err = w.WriteH264(2*time.Second, 2*time.Second, [][]byte{{5, 2, 3, 4}})
+				err = w.WriteH264(track, 2*time.Second, 2*time.Second, [][]byte{{5, 2, 3, 4}})
 				require.NoError(t, err)
 
 			case "webrtc":
-				u, err := url.Parse("http://localhost:8889/mypath/whip")
+				var u *url.URL
+				u, err = url.Parse("http://localhost:8889/mypath/whip")
 				require.NoError(t, err)
-
-				c := &whip.Client{
-					HTTPClient: hc,
-					URL:        u,
-					Log:        test.NilLogger,
-				}
 
 				track := &webrtc.OutgoingTrack{
 					Caps: pwebrtc.RTPCodecCapability{
@@ -1033,7 +1077,15 @@ func TestAPIProtocolKick(t *testing.T) {
 					},
 				}
 
-				err = c.Publish(context.Background(), []*webrtc.OutgoingTrack{track})
+				c := &whip.Client{
+					HTTPClient:     hc,
+					URL:            u,
+					Log:            test.NilLogger,
+					Publish:        true,
+					OutgoingTracks: []*webrtc.OutgoingTrack{track},
+				}
+
+				err = c.Initialize(context.Background())
 				require.NoError(t, err)
 				defer func() {
 					require.Error(t, c.Close())
@@ -1043,19 +1095,21 @@ func TestAPIProtocolKick(t *testing.T) {
 				conf := srt.DefaultConfig()
 				conf.StreamId = "publish:mypath"
 
-				conn, err := srt.Dial("srt", "localhost:8890", conf)
+				var conn srt.Conn
+				conn, err = srt.Dial("srt", "localhost:8890", conf)
 				require.NoError(t, err)
 				defer conn.Close()
 
 				track := &mpegts.Track{
-					Codec: &mpegts.CodecH264{},
+					Codec: &tscodecs.H264{},
 				}
 
 				bw := bufio.NewWriter(conn)
-				w := mpegts.NewWriter(bw, []*mpegts.Track{track})
+				w := &mpegts.Writer{W: bw, Tracks: []*mpegts.Track{track}}
+				err = w.Initialize()
 				require.NoError(t, err)
 
-				err = w.WriteH2642(track, 0, 0, [][]byte{{1}})
+				err = w.WriteH264(track, 0, 0, [][]byte{{1}})
 				require.NoError(t, err)
 
 				err = bw.Flush()
@@ -1117,19 +1171,19 @@ func TestAPIProtocolKickNotFound(t *testing.T) {
 		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
-			conf := "api: yes\n"
+			cnf := "api: yes\n"
 
 			if ca == "rtsps" {
-				conf += "rtspTransports: [tcp]\n" +
+				cnf += "rtspTransports: [tcp]\n" +
 					"rtspEncryption: strict\n" +
 					"rtspServerCert: " + serverCertFpath + "\n" +
 					"rtspServerKey: " + serverKeyFpath + "\n"
 			}
 
-			conf += "paths:\n" +
+			cnf += "paths:\n" +
 				"  all_others:\n"
 
-			p, ok := newInstance(conf)
+			p, ok := newInstance(cnf)
 			require.Equal(t, true, ok)
 			defer p.Close()
 
@@ -1156,10 +1210,12 @@ func TestAPIProtocolKickNotFound(t *testing.T) {
 			}
 
 			func() {
-				req, err := http.NewRequest(http.MethodPost, "http://localhost:9997/v3/"+pa+"/kick/"+uuid.New().String(), nil)
+				var req *http.Request
+				req, err = http.NewRequest(http.MethodPost, "http://localhost:9997/v3/"+pa+"/kick/"+uuid.New().String(), nil)
 				require.NoError(t, err)
 
-				res, err := hc.Do(req)
+				var res *http.Response
+				res, err = hc.Do(req)
 				require.NoError(t, err)
 				defer res.Body.Close()
 

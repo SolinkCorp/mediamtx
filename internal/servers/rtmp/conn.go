@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortmplib"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/auth"
@@ -21,21 +21,6 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/rtmp"
 	"github.com/bluenviron/mediamtx/internal/stream"
-)
-
-func pathNameAndQuery(inURL *url.URL) (string, url.Values, string) {
-	// remove leading and trailing slashes inserted by OBS and some other clients
-	tmp := strings.TrimRight(inURL.String(), "/")
-	ur, _ := url.Parse(tmp)
-	pathName := strings.TrimLeft(ur.Path, "/")
-	return pathName, ur.Query(), ur.RawQuery
-}
-
-type connState int
-
-const (
-	connStateRead connState = iota + 1
-	connStatePublish
 )
 
 type conn struct {
@@ -58,8 +43,8 @@ type conn struct {
 	uuid      uuid.UUID
 	created   time.Time
 	mutex     sync.RWMutex
-	rconn     *rtmp.Conn
-	state     connState
+	rconn     *gortmplib.ServerConn
+	state     defs.APIRTMPConnState
 	pathName  string
 	query     string
 }
@@ -69,6 +54,7 @@ func (c *conn) initialize() {
 
 	c.uuid = uuid.New()
 	c.created = time.Now()
+	c.state = defs.APIRTMPConnStateIdle
 
 	c.Log(logger.Info, "opened")
 
@@ -85,8 +71,8 @@ func (c *conn) remoteAddr() net.Addr {
 }
 
 // Log implements logger.Writer.
-func (c *conn) Log(level logger.Level, format string, args ...interface{}) {
-	c.parent.Log(level, "[conn %v] "+format, append([]interface{}{c.nconn.RemoteAddr()}, args...)...)
+func (c *conn) Log(level logger.Level, format string, args ...any) {
+	c.parent.Log(level, "[conn %v] "+format, append([]any{c.nconn.RemoteAddr()}, args...)...)
 }
 
 func (c *conn) ip() net.IP {
@@ -103,7 +89,7 @@ func (c *conn) run() { //nolint:dupl
 		RunOnConnectRestart: c.runOnConnectRestart,
 		RunOnDisconnect:     c.runOnDisconnect,
 		RTSPAddress:         c.rtspAddress,
-		Desc:                c.APIReaderDescribe(),
+		Desc:                *c.APIReaderDescribe(),
 	})
 	defer onDisconnectHook()
 
@@ -137,7 +123,16 @@ func (c *conn) runInner() error {
 func (c *conn) runReader() error {
 	c.nconn.SetReadDeadline(time.Now().Add(time.Duration(c.readTimeout)))
 	c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-	conn, u, publish, err := rtmp.NewServerConn(c.nconn)
+
+	conn := &gortmplib.ServerConn{
+		RW: c.nconn,
+	}
+	err := conn.Initialize()
+	if err != nil {
+		return err
+	}
+
+	err = conn.Accept()
 	if err != nil {
 		return err
 	}
@@ -146,31 +141,34 @@ func (c *conn) runReader() error {
 	c.rconn = conn
 	c.mutex.Unlock()
 
-	if !publish {
-		return c.runRead(conn, u)
+	if !conn.Publish {
+		return c.runRead()
 	}
-	return c.runPublish(conn, u)
+	return c.runPublish()
 }
 
-func (c *conn) runRead(conn *rtmp.Conn, u *url.URL) error {
-	pathName, query, rawQuery := pathNameAndQuery(u)
+func (c *conn) runRead() error {
+	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
+	query := c.rconn.URL.Query()
 
-	path, stream, err := c.pathManager.AddReader(defs.PathAddReaderReq{
+	path, strm, err := c.pathManager.AddReader(defs.PathAddReaderReq{
 		Author: c,
 		AccessRequest: defs.PathAccessRequest{
 			Name:  pathName,
-			Query: rawQuery,
-			IP:    c.ip(),
-			User:  query.Get("user"),
-			Pass:  query.Get("pass"),
+			Query: c.rconn.URL.RawQuery,
 			Proto: auth.ProtocolRTMP,
 			ID:    &c.uuid,
+			Credentials: &auth.Credentials{
+				User: query.Get("user"),
+				Pass: query.Get("pass"),
+			},
+			IP: c.ip(),
 		},
 	})
 	if err != nil {
 		var terr *auth.Error
 		if errors.As(err, &terr) {
-			// wait some seconds to mitigate brute force attacks
+			// wait some seconds to delay brute force attacks
 			<-time.After(auth.PauseAfterError)
 			return terr
 		}
@@ -180,64 +178,87 @@ func (c *conn) runRead(conn *rtmp.Conn, u *url.URL) error {
 	defer path.RemoveReader(defs.PathRemoveReaderReq{Author: c})
 
 	c.mutex.Lock()
-	c.state = connStateRead
+	c.state = defs.APIRTMPConnStateRead
 	c.pathName = pathName
-	c.query = rawQuery
+	c.query = c.rconn.URL.RawQuery
 	c.mutex.Unlock()
 
-	err = rtmp.FromStream(stream, c, conn, c.nconn, time.Duration(c.writeTimeout))
+	r := &stream.Reader{Parent: c}
+
+	err = rtmp.FromStream(strm.Desc, r, c.rconn, c.nconn, time.Duration(c.writeTimeout))
 	if err != nil {
 		return err
 	}
 
 	c.Log(logger.Info, "is reading from path '%s', %s",
-		path.Name(), defs.FormatsInfo(stream.ReaderFormats(c)))
+		path.Name(), defs.FormatsInfo(r.Formats()))
 
 	onUnreadHook := hooks.OnRead(hooks.OnReadParams{
 		Logger:          c,
 		ExternalCmdPool: c.externalCmdPool,
 		Conf:            path.SafeConf(),
 		ExternalCmdEnv:  path.ExternalCmdEnv(),
-		Reader:          c.APISourceDescribe(),
-		Query:           rawQuery,
+		Reader:          *c.APIReaderDescribe(),
+		Query:           c.rconn.URL.RawQuery,
 	})
 	defer onUnreadHook()
 
-	// disable read deadline
 	c.nconn.SetReadDeadline(time.Time{})
 
-	stream.StartReader(c)
-	defer stream.RemoveReader(c)
+	strm.AddReader(r)
+	defer strm.RemoveReader(r)
 
 	select {
 	case <-c.ctx.Done():
 		return fmt.Errorf("terminated")
 
-	case err := <-stream.ReaderError(c):
+	case err = <-r.Error():
 		return err
 	}
 }
 
-func (c *conn) runPublish(conn *rtmp.Conn, u *url.URL) error {
-	pathName, query, rawQuery := pathNameAndQuery(u)
+func (c *conn) runPublish() error {
+	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
+	query := c.rconn.URL.Query()
 
-	path, err := c.pathManager.AddPublisher(defs.PathAddPublisherReq{
-		Author: c,
+	r := &gortmplib.Reader{
+		Conn: c.rconn,
+	}
+	err := r.Initialize()
+	if err != nil {
+		return err
+	}
+
+	var subStream *stream.SubStream
+
+	medias, err := rtmp.ToStream(r, &subStream)
+	if err != nil {
+		return err
+	}
+
+	var path defs.Path
+	path, subStream, err = c.pathManager.AddPublisher(defs.PathAddPublisherReq{
+		Author:        c,
+		Desc:          &description.Session{Medias: medias},
+		UseRTPPackets: false,
+		ReplaceNTP:    true,
 		AccessRequest: defs.PathAccessRequest{
 			Name:    pathName,
-			Query:   rawQuery,
+			Query:   c.rconn.URL.RawQuery,
 			Publish: true,
-			IP:      c.ip(),
-			User:    query.Get("user"),
-			Pass:    query.Get("pass"),
 			Proto:   auth.ProtocolRTMP,
 			ID:      &c.uuid,
+			Credentials: &auth.Credentials{
+				User: query.Get("user"),
+				Pass: query.Get("pass"),
+			},
+			IP: c.ip(),
 		},
 	})
 	if err != nil {
 		var terr *auth.Error
 		if errors.As(err, &terr) {
-			// wait some seconds to mitigate brute force attacks
+			// wait some seconds to delay brute force attacks
 			<-time.After(auth.PauseAfterError)
 			return terr
 		}
@@ -247,38 +268,16 @@ func (c *conn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 	defer path.RemovePublisher(defs.PathRemovePublisherReq{Author: c})
 
 	c.mutex.Lock()
-	c.state = connStatePublish
+	c.state = defs.APIRTMPConnStatePublish
 	c.pathName = pathName
-	c.query = rawQuery
+	c.query = c.rconn.URL.RawQuery
 	c.mutex.Unlock()
 
-	r, err := rtmp.NewReader(conn)
-	if err != nil {
-		return err
-	}
-
-	var stream *stream.Stream
-
-	medias, err := rtmp.ToStream(r, &stream)
-	if err != nil {
-		return err
-	}
-
-	stream, err = path.StartPublisher(defs.PathStartPublisherReq{
-		Author:             c,
-		Desc:               &description.Session{Medias: medias},
-		GenerateRTPPackets: true,
-	})
-	if err != nil {
-		return err
-	}
-
-	// disable write deadline to allow outgoing acknowledges
 	c.nconn.SetWriteDeadline(time.Time{})
 
 	for {
 		c.nconn.SetReadDeadline(time.Now().Add(time.Duration(c.readTimeout)))
-		err := r.Read()
+		err = r.Read()
 		if err != nil {
 			return err
 		}
@@ -286,8 +285,8 @@ func (c *conn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 }
 
 // APIReaderDescribe implements reader.
-func (c *conn) APIReaderDescribe() defs.APIPathSourceOrReader {
-	return defs.APIPathSourceOrReader{
+func (c *conn) APIReaderDescribe() *defs.APIPathReader {
+	return &defs.APIPathReader{
 		Type: func() string {
 			if c.isTLS {
 				return "rtmpsConn"
@@ -299,8 +298,16 @@ func (c *conn) APIReaderDescribe() defs.APIPathSourceOrReader {
 }
 
 // APISourceDescribe implements source.
-func (c *conn) APISourceDescribe() defs.APIPathSourceOrReader {
-	return c.APIReaderDescribe()
+func (c *conn) APISourceDescribe() *defs.APIPathSource {
+	return &defs.APIPathSource{
+		Type: func() string {
+			if c.isTLS {
+				return "rtmpsConn"
+			}
+			return "rtmpConn"
+		}(),
+		ID: c.uuid.String(),
+	}
 }
 
 func (c *conn) apiItem() *defs.APIRTMPConn {
@@ -316,21 +323,10 @@ func (c *conn) apiItem() *defs.APIRTMPConn {
 	}
 
 	return &defs.APIRTMPConn{
-		ID:         c.uuid,
-		Created:    c.created,
-		RemoteAddr: c.remoteAddr().String(),
-		State: func() defs.APIRTMPConnState {
-			switch c.state {
-			case connStateRead:
-				return defs.APIRTMPConnStateRead
-
-			case connStatePublish:
-				return defs.APIRTMPConnStatePublish
-
-			default:
-				return defs.APIRTMPConnStateIdle
-			}
-		}(),
+		ID:            c.uuid,
+		Created:       c.created,
+		RemoteAddr:    c.remoteAddr().String(),
+		State:         c.state,
 		Path:          c.pathName,
 		Query:         c.query,
 		BytesReceived: bytesReceived,
