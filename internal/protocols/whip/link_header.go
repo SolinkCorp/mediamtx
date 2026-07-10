@@ -4,14 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/pion/webrtc/v4"
 )
 
 func quoteCredential(v string) string {
-	b, _ := json.Marshal(v)
-	s := string(b)
-	return s[1 : len(s)-1]
+	escaped := strings.ReplaceAll(v, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return escaped
 }
 
 func unquoteCredential(v string) string {
