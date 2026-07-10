@@ -30,6 +30,20 @@ var linkHeaderCases = []struct {
 			},
 		},
 	},
+	{
+		"credential with embedded quotes",
+		[]string{
+			`<turns:turn.example.com>; rel="ice-server"; username="user"; ` +
+				`credential="pass\"word"; credential-type="password"`,
+		},
+		[]webrtc.ICEServer{
+			{
+				URLs:       []string{"turns:turn.example.com"},
+				Username:   "user",
+				Credential: `pass"word`,
+			},
+		},
+	},
 }
 
 func TestLinkHeaderUnmarshal(t *testing.T) {
